@@ -333,7 +333,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
 
     
     def get_action(self, obs_dict, goal_dict=None):
-        print("Use?", self.use_action_scheduler, self.use_ood_monitor)
+        # print("Use?", self.use_action_scheduler, self.use_ood_monitor)
         if len(self.action_queue) == 0:
             # 1. 执行模型推理
             action_sequence = self._get_action_trajectory(obs_dict=obs_dict)
@@ -378,7 +378,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             chunk = action_sequence_2d[:final_len]
             self.action_queue.extend(chunk)
 
-            print("chunk_size", chunk.shape)
+            # print("chunk_size", chunk.shape)
 
             # 7. 日志记录
             self.last_execution_info = {
@@ -397,7 +397,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         else:
             if self.last_execution_info is not None:
                 self.last_execution_info["step_log"] = False
-        print("Action queue length:", len(self.action_queue))
+        # print("Action queue length:", len(self.action_queue))
         return self.action_queue.popleft().unsqueeze(0)
 
 
