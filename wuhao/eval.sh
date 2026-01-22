@@ -40,18 +40,24 @@
 # --n_rollouts 50 --horizon 600 --seed 0 --video_path /home/wuhao/jobspace/robomimic/wuhao/video/tool_hang_f/output.mp4 \
 # --camera_names agentview robot0_eye_in_hand --device cuda --parallel 6
 
-EXP_NAME="baseline_10"
+# EXP_NAME="baseline_16_2"
+# EXP_NAME="frequency_16_no_noise_gate"
+# EXP_NAME="baseline_8"
+# EXP_NAME="ood_16_test"
 
 
-CUDA_VISIBLE_DEVICES=0 \
-python /home/wuhao/jobspace/robomimic/robomimic/scripts/run_trained_agent.py \
---agent /home/wuhao/jobspace/robomimic/wuhao/ckpt/dp/low_dim_square/20260121020517/models/model_epoch_2_low_dim_v15_success_0.64.pth \
---n_rollouts 50 --horizon 400 --seed 0 --device cuda --parallel 8 --video_path /home/wuhao/jobspace/robomimic/wuhao/video/${EXP_NAME}/output.mp4 \
---camera_names agentview --log_dir /home/wuhao/jobspace/robomimic/wuhao/logs/${EXP_NAME} --action_horizon 10 \
+# CUDA_VISIBLE_DEVICES=3 \
+# python /home/wuhao/jobspace/robomimic/robomimic/scripts/run_trained_agent.py \
+# --agent /home/wuhao/jobspace/robomimic/wuhao/ckpt/dp/low_dim_square/20260121020517/models/model_epoch_2_low_dim_v15_success_0.64.pth \
+# --n_rollouts 50 --horizon 400 --seed 0 --device cuda --parallel 8 --video_path /home/wuhao/jobspace/robomimic/wuhao/video/square/${EXP_NAME}/output.mp4 \
+# --camera_names agentview --log_dir /home/wuhao/jobspace/robomimic/wuhao/logs/square/${EXP_NAME} --action_horizon 16 \
 # --use_action_scheduler --use_ood_monitor
 
+EXP_NAME="baseline_16_initstate_test_3"
 
-# CUDA_VISIBLE_DEVICES=0 \
-# python /home/wuhao/jobspace/robomimic/robomimic/scripts/run_trained_agent_wh.py \
-# --agent /home/wuhao/jobspace/robomimic/wuhao/ckpt/dp/low_dim_square/20260121020517/models/model_epoch_2_low_dim_v15_success_0.64.pth \
-# --n_rollouts 50 --horizon 400 --seed 0 --device cuda --parallel 8 
+CUDA_VISIBLE_DEVICES=1 \
+python /home/wuhao/jobspace/robomimic/robomimic/scripts/run_trained_agent.py \
+--agent /home/wuhao/jobspace/robomimic/wuhao/ckpt/dp/low_dim_tool_hang/20260121084406/models/model_epoch_10_low_dim_v15_success_0.18.pth \
+--n_rollouts 200 --horizon 600 --seed 0 --device cuda --parallel 8 --video_path /home/wuhao/jobspace/robomimic/wuhao/video/toolhang/${EXP_NAME}/output.mp4 \
+--camera_names agentview --log_dir /home/wuhao/jobspace/robomimic/wuhao/logs/toolhang/${EXP_NAME} --action_horizon 16 --init_states_file /home/wuhao/jobspace/robomimic/datasets/tool_hang/states/tool_hang_init_states_10.pkl \
+# --use_action_scheduler --use_ood_monitor
