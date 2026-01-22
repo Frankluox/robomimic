@@ -577,10 +577,21 @@ def run_trained_agent(args):
     # ============== 修改结束 =================
 
     rollout_stats = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
-    avg_rollout_stats = { k : np.mean(rollout_stats[k]) for k in rollout_stats }
-    avg_rollout_stats["Num_Success"] = np.sum(rollout_stats["Success_Rate"])
+    # [修改] 将 numpy 类型转换为原生 Python 类型，确保 JSON 序列化不出错
+    avg_rollout_stats = { k : float(np.mean(rollout_stats[k])) for k in rollout_stats }
+    avg_rollout_stats["Num_Success"] = int(np.sum(rollout_stats["Success_Rate"]))
+
     print("Average Rollout Stats")
     print(json.dumps(avg_rollout_stats, indent=4))
+
+    # [新增] 将结果保存到指定的 log_dir 目录下
+    if args.log_dir is not None:
+        # 确保目录存在
+        os.makedirs(args.log_dir, exist_ok=True)
+        result_json_path = os.path.join(args.log_dir, "results.json")
+        with open(result_json_path, 'w') as f:
+            json.dump(avg_rollout_stats, f, indent=4)
+        print(f"Saved average rollout stats to {result_json_path}")
 
 
     if write_dataset:
