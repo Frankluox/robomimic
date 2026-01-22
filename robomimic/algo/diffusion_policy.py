@@ -34,6 +34,9 @@ from OOD_detect_as_a_function import OODMonitor
 
 import numpy as np
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 
 @register_algo_factory_func("diffusion_policy")
 def algo_config_to_class(algo_config):
@@ -77,14 +80,16 @@ class DiffusionPolicyUNet(PolicyAlgo):
             # 初始化调度器
             self.action_scheduler = ActionScheduler(safety_lambda=1.0, power_threshold=0.95)
             self.ood_monitor = OODMonitor(
-                    max_prediction_len=self.algo_config.horizon, # 模型输出长度 (T)
-                    max_ood_bound=self.algo_config.horizon # OOD 严重时的强制执行长度
+                    max_prediction_len=self.algo_config.horizon.action_horizon, # 模型输出长度 (T)
+                    max_ood_bound=self.algo_config.horizon.action_horizon # OOD 严重时的强制执行长度
                 )
+            print(self.ood_monitor.max_len)
             print("Successfully initialized ActionScheduler and OODMonitor in DiffusionPolicyUNet.")
         except Exception as e:
             print(f"Warning: Could not initialize ActionScheduler or OODMonitor: {e}")
             self.action_scheduler = None
             self.ood_monitor = None
+            raise e
             
         self.last_execution_info = None
 
@@ -351,10 +356,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
 
             # 3. [模式：只开 Action Scheduler 或 两个都开] 
             # 计算基于复杂度的截断长度（上限控制）
+            # print(self.action_scheduler)
             if self.use_action_scheduler and self.action_scheduler is not None:
                 _, _, target_len, reason = self.action_scheduler.step(action_sequence_np, None)
                 final_len = target_len
 
+                # print("length after scheduler",final_len)
             # 4. [模式：两个都开]
             # 计算基于 OOD 的执行下界（下界控制/平滑）
             if self.use_ood_monitor and self.ood_monitor is not None:
@@ -387,6 +394,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 "use_sched": self.use_action_scheduler,
                 "use_ood": self.use_ood_monitor,
                 "ood_score": ood_score,
+                "ood_suggested_bound": lower_bound,
                 "reason": reason,
                 "step_log": True
             }
@@ -518,6 +526,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
         noisy_action = torch.randn(
             (B, Tp, action_dim), device=self.device)
         naction = noisy_action
+
+        # np.set_printoptions(suppress=True)
+
+        # print("=================noise=============")
+        # print(np.round(naction.cpu().numpy(), 4))
+        # print("===============")
         
         # init scheduler
         self.noise_scheduler.set_timesteps(num_inference_timesteps)
@@ -529,6 +543,10 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 timestep=k,
                 global_cond=obs_cond
             )
+
+            # print("=================noise_pred=============")
+            # print(np.round(noise_pred.cpu().numpy(), 4))
+            # print("===============")
 
             # inverse diffusion step (remove noise)
             naction = self.noise_scheduler.step(

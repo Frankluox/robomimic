@@ -105,7 +105,7 @@ def log_listener(msg_queue):
             break
 
 
-def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None, rollout_id=0, log_dir=None):
+def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None, rollout_id=0, log_dir=None, init_state=None):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
     and returns the rollout trajectory.
@@ -142,11 +142,16 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     
 
     policy.start_episode()
-    obs = env.reset()
-    state_dict = env.get_state()
 
-    # hack that is necessary for robosuite tasks for deterministic action playback
-    obs = env.reset_to(state_dict)
+    
+    if init_state is not None:
+        obs = env.reset_to(init_state)
+        state_dict = init_state
+    else:
+        obs = env.reset()
+        state_dict = env.get_state()
+        # hack that is necessary for robosuite tasks for deterministic action playback
+        obs = env.reset_to(state_dict)
 
     results = {}
     video_count = 0  # video frame counter
@@ -164,6 +169,8 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
 
             # get action from policy
             act = policy(ob=obs)
+
+            # print(act)
 
             # [新增] --- 数据记录逻辑开始 ---
             # 1. 获取图像
@@ -201,7 +208,8 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
                         "use_sched": info["use_sched"],
                         "use_ood": info["use_ood"],
                         "ood_score": info["ood_score"],
-                        "reason": info["reason"]
+                        "reason": info["reason"],
+                        "ood_suggested_bound": info["ood_suggested_bound"],
                     }
                     evaluation_logs.append(log_entry)
             # [新增] --- 数据记录逻辑结束 ---
@@ -291,7 +299,7 @@ def rollout_parallel_wrapper(args_tuple):
     用于多进程的 Worker 函数。
     """
 
-    ckpt_path, env_name, horizon, seed, device_str, dataset_obs, camera_names, video_path, video_skip, index, log_dir, msg_queue, action_horizon, use_action_scheduler, use_ood_monitor = args_tuple
+    ckpt_path, env_name, horizon, seed, device_str, dataset_obs, camera_names, video_path, video_skip, index, log_dir, msg_queue, action_horizon, use_action_scheduler, use_ood_monitor, init_state = args_tuple
 
     
 
@@ -382,7 +390,8 @@ def rollout_parallel_wrapper(args_tuple):
             camera_names=camera_names,
             rollout_id=index,
             # log_dir="/home/wuhao/jobspace/robomimic/wuhao/logs" # 传入保存目录
-            log_dir=log_dir # 传入保存目录
+            log_dir=log_dir, # 传入保存目录
+            init_state=init_state
         )
     
         # [修改] 视频重命名逻辑 (Success / Failed)
@@ -522,10 +531,23 @@ def run_trained_agent(args):
     print(f"Running evaluation with {num_workers} processes on {args.device.upper()}...")
     print(f"Logs for each rollout will be saved in {args.log_dir}")
 
+    init_states = None
+    if args.init_states_file:
+        print(f"Loading initial states from {args.init_states_file}...")
+        with open(args.init_states_file, 'rb') as f:
+            init_states = pickle.load(f)
+        print(f"Loaded {len(init_states)} states.")
+        assert len(init_states) >= args.n_rollouts, "Not enough initial states provided."
+
     work_items = []
     
     for i in range(rollout_num_episodes):
         curr_seed = args.seed + i if args.seed is not None else None
+
+        init_state = None
+        if init_states is not None:
+            init_state = init_states[i]
+
         work_items.append((
             ckpt_path, 
             args.env, 
@@ -541,7 +563,8 @@ def run_trained_agent(args):
             msg_queue, # [新增] 传入 queue    
             args.action_horizon, # [新增] 将命令行参数传入 Worker 
             args.use_action_scheduler, # [NEW] Pass argument
-            args.use_ood_monitor       # [NEW] Pass argument
+            args.use_ood_monitor,       # [NEW] Pass argument
+            init_state       
         ))
 
     with multiprocessing.Pool(num_workers) as pool:
@@ -735,6 +758,13 @@ if __name__ == "__main__":
         "--use_ood_monitor", 
         action='store_true', 
         help="enable OOD monitor in Diffusion Policy"
+    )
+
+    parser.add_argument(
+        "--init_states_file",
+        type=str,
+        default=None,
+        help="path to pickled initial states file for deterministic evaluation",
     )
 
     # [新增] log_dir 参数
