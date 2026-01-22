@@ -57,6 +57,13 @@ import h5py
 import imageio
 import numpy as np
 from copy import deepcopy
+import os
+import gc
+import multiprocessing
+import threading  # [新增] 用于监听日志队列
+import queue      # [新增]
+import pickle # [新增] 用于保存数据
+import sys # [新增] 用于控制标准输出
 
 import torch
 
@@ -70,7 +77,35 @@ from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
 
 
-def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None):
+# [新增] 定义一个只写文件的 Logger，强制刷新以防丢失日志
+class FileLogger(object):
+    def __init__(self, filename, mode="a"):
+        self.log = open(filename, mode)
+    
+    def write(self, message):
+        self.log.write(message)
+        self.log.flush() # [关键] 强制刷新，确保内容立即写入硬盘
+        
+    def flush(self):
+        self.log.flush()
+        
+    def close(self):
+        self.log.close()
+
+# [新增] 监听线程函数：在主进程中运行，负责打印各 Worker 的状态
+def log_listener(msg_queue):
+    while True:
+        try:
+            msg = msg_queue.get()
+            if msg == "KILL": # 结束信号
+                break
+            print(msg) # 这里是主进程，打印到真正的终端
+            sys.stdout.flush()
+        except Exception:
+            break
+
+
+def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None, rollout_id=0, log_dir=None):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
     and returns the rollout trajectory.
@@ -96,6 +131,16 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     assert isinstance(policy, RolloutPolicy)
     assert not (render and (video_writer is not None))
 
+
+    # [新增] 初始化数据存储列表
+    # 我们将存储 (step, image, full_chunk, truncation_length)
+
+
+    evaluation_logs = []
+
+
+    
+
     policy.start_episode()
     obs = env.reset()
     state_dict = env.get_state()
@@ -110,12 +155,57 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     if return_obs:
         # store observations too
         traj.update(dict(obs=[], next_obs=[]))
+
+    success = False # 初始化 success 变量，防止 horizon=0 时报错
+
     try:
         for step_i in range(horizon):
+
 
             # get action from policy
             act = policy(ob=obs)
 
+            # [新增] --- 数据记录逻辑开始 ---
+            # 1. 获取图像
+            # 需要 env.render (注意这可能会影响性能)
+            image_to_log = None
+            # print(obs.keys())
+
+            try:
+                # 无论 render 是否为 True，只要 render_offscreen 开启了就能渲染
+                image_to_log = env.render(
+                    mode="rgb_array", 
+                    height=128, 
+                    width=128, 
+                    camera_name=camera_names[0]
+                )
+            except Exception as e:
+                # 只有在第一步打印错误，避免日志刷屏
+                if step_i == 0:
+                    print(f"渲染失败，请检查是否在 eval.sh 中设置了 --video_path: {e}")
+
+            # 2. 获取 Policy 内部的日志
+            # policy 是 RolloutPolicy 实例，policy.policy 是 DiffusionPolicyUNet 实例
+            internal_policy = policy.policy 
+            if hasattr(internal_policy, "last_execution_info") and internal_policy.last_execution_info:
+                info = internal_policy.last_execution_info
+                
+                # 我们只在发生推理的那一步记录（或者你想每步都记也可以，但数据量会很大）
+                # 这里假设只要有 info 且是新推理的(step_log=True)就记录
+                if info.get("step_log", True):
+                    log_entry = {
+                        "step": step_i,
+                        "image": image_to_log, # 注意：图片数据量很大，确保存储空间足够
+                        "full_action_chunk": info["full_action_chunk"],
+                        "truncation_length": info["final_len"],
+                        "use_sched": info["use_sched"],
+                        "use_ood": info["use_ood"],
+                        "ood_score": info["ood_score"],
+                        "reason": info["reason"]
+                    }
+                    evaluation_logs.append(log_entry)
+            # [新增] --- 数据记录逻辑结束 ---
+            
             # play action
             next_obs, r, done, _ = env.step(act)
 
@@ -155,7 +245,28 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     except env.rollout_exceptions as e:
         print("WARNING: got rollout exception {}".format(e))
 
+    # 这里处理 step_i 还没定义的情况 (如 horizon=0 或直接报错)
+    horizon_len = step_i + 1 if 'step_i' in locals() else 0
     stats = dict(Return=total_reward, Horizon=(step_i + 1), Success_Rate=float(success))
+
+
+    # [新增] --- 保存日志 ---
+    # 建议保存为 pickle 文件，文件名包含一些唯一标识
+    # 注意：由于是在 rollout 函数里，可能需要传入额外的参数来指定保存路径或 ID
+    # 这里简单起见，假设你可以在 args 里传个路径前缀
+    if len(evaluation_logs) > 0 and log_dir:
+        save_path = os.path.join(log_dir, f"log_rollout_{rollout_id}.pkl")
+        with open(save_path, "wb") as f:
+            pickle.dump(evaluation_logs, f)
+
+    # [修改] 使用传入的 log_dir 保存日志
+    if len(evaluation_logs) > 0 and log_dir:
+        # 确保目录存在 (虽然主进程已经创建，但双重保险无害)
+        os.makedirs(log_dir, exist_ok=True)
+        save_path = os.path.join(log_dir, f"log_rollout_{rollout_id}.pkl")
+        with open(save_path, "wb") as f:
+            pickle.dump(evaluation_logs, f)
+            print(f"Saved rollout log to {save_path}") # 这行会被重定向
 
     if return_obs:
         # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
@@ -175,8 +286,155 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     return stats, traj
 
 
+def rollout_parallel_wrapper(args_tuple):
+    """
+    用于多进程的 Worker 函数。
+    """
+
+    ckpt_path, env_name, horizon, seed, device_str, dataset_obs, camera_names, video_path, video_skip, index, log_dir, msg_queue, action_horizon, use_action_scheduler, use_ood_monitor = args_tuple
+
+    
+
+    # [新增] 设置日志重定向
+
+    # [关键修改] 每个 Worker 无条件重定向到自己的日志文件
+    # 不再判断 index == 0
+    if log_dir is not None:
+        # 每个进程独立的文本日志
+        log_file = os.path.join(log_dir, f"worker_rollout_{index}.txt")
+        # 保存原始 stdout 以便恢复(可选，但在 Pool 中通常不需要)
+
+        original_stdout = sys.stdout 
+        original_stderr = sys.stderr
+        
+        file_logger = FileLogger(log_file)
+        sys.stdout = file_logger
+        sys.stderr = file_logger
+
+    try:
+        # 向主进程报告：开始
+        if msg_queue:
+            msg_queue.put(f"[Main] Task {index} Started on PID {os.getpid()}...")
+
+        device = torch.device(device_str)
+        
+        # 此时所有的 print 都会进入 log_file
+        print(f"Start processing rollout {index} on device {device}")
+
+        # 加载策略 (verbose=False 减少日志输出)
+        policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=False)
+
+        # [NEW] Inject the flags into the underlying policy model
+        # policy is a RolloutPolicy wrapper, policy.policy is the DiffusionPolicyUNet instance
+        if hasattr(policy.policy, "use_action_scheduler"):
+            policy.policy.use_action_scheduler = use_action_scheduler
+            if msg_queue and index == 0:
+                msg_queue.put(f"Set use_action_scheduler to {use_action_scheduler}")
+
+        if hasattr(policy.policy, "use_ood_monitor"):
+            policy.policy.use_ood_monitor = use_ood_monitor
+            if msg_queue and index == 0:
+                msg_queue.put(f"Set use_ood_monitor to {use_ood_monitor}")
+
+        # [关键修改]：如果有传入 action_horizon，强制覆盖 policy 内部的配置
+        if action_horizon is not None:
+            # policy 是 RolloutPolicy，policy.policy 才是实际的算法实例(DiffusionPolicyUNet)
+            # 必须同时修改 algo_config，因为 reset() 函数也会用到它来设置队列长度
+            with policy.policy.algo_config.values_unlocked():
+                policy.policy.algo_config.horizon.action_horizon = action_horizon
+            # 建议打印一下确认覆盖成功 (只在第0个worker打印避免刷屏)
+            if msg_queue:
+                msg_queue.put(f"Overriding Action Horizon to: {action_horizon}")
+                print(f"Overriding Action Horizon to: {action_horizon}")
+
+        # 创建独立的环境实例
+        # 这里的 render 必须设为 False，因为多进程无法抢占屏幕渲染
+        env, _ = FileUtils.env_from_checkpoint(
+            ckpt_dict=ckpt_dict, 
+            env_name=env_name, 
+            render=False, 
+            render_offscreen=(video_path is not None), 
+            verbose=False,
+        )
+
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+        video_writer = None
+        if video_path is not None:
+            # 构造唯一文件名，例如: output.mp4 -> output_0.mp4
+            root, ext = os.path.splitext(video_path)
+            worker_video_path = f"{root}_{index}{ext}"
+            try:
+                video_writer = imageio.get_writer(worker_video_path, fps=20)
+            except Exception as e:
+                print(f"Error creating video writer: {e}")
+
+        stats, traj = rollout(
+            policy=policy, 
+            env=env, 
+            horizon=horizon, 
+            render=False, 
+            video_writer=video_writer, 
+            video_skip=video_skip, 
+            return_obs=dataset_obs,
+            camera_names=camera_names,
+            rollout_id=index,
+            # log_dir="/home/wuhao/jobspace/robomimic/wuhao/logs" # 传入保存目录
+            log_dir=log_dir # 传入保存目录
+        )
+    
+        # [修改] 视频重命名逻辑 (Success / Failed)
+        if video_path is not None and worker_video_path is not None:
+            try:
+                video_writer.close() # 显式关闭以防万一
+            except:
+                pass
+                
+            try:
+                if stats['Success_Rate'] > 0:
+                    new_name = worker_video_path.replace(".mp4", "_success.mp4")
+                    os.rename(worker_video_path, new_name)
+                    print(f"Video saved to {new_name}")
+                else:
+                    # [新增] 失败也改名
+                    new_name = worker_video_path.replace(".mp4", "_failed.mp4")
+                    os.rename(worker_video_path, new_name)
+                    print(f"Video saved to {new_name}")
+            except OSError as e:
+                print(f"Error renaming video file: {e}")
+
+        # 向主进程报告：结束
+
+        status_str = "SUCCESS" if stats['Success_Rate'] > 0 else "FAILED"
+        if msg_queue:
+            msg_queue.put(f"[Main] Task {index} Finished: {status_str} (Return: {stats['Return']:.2f})")
+
+        del policy  
+        del env     
+        gc.collect() 
+        torch.cuda.empty_cache() 
+    
+
+        return stats, traj
+
+    except Exception as e:
+        # 捕获所有异常并打印到日志文件，同时通知主进程
+        print(f"CRITICAL ERROR in Worker {index}: {e}")
+        import traceback
+        traceback.print_exc()
+        if msg_queue:
+            msg_queue.put(f"[Main] Task {index} CRASHED! Check log: worker_rollout_{index}.txt")
+        return None, None
+    finally:
+        # [可选] 可以在这里关闭 file_logger，虽然进程结束会自动关闭
+        if 'file_logger' in locals():
+            file_logger.close()
+
+
 def run_trained_agent(args):
-    # some arg checking
+
     write_video = (args.video_path is not None)
     assert not (args.render and write_video) # either on-screen or video but not both
     if args.render:
@@ -185,12 +443,29 @@ def run_trained_agent(args):
 
     # relative path to agent
     ckpt_path = args.agent
+    
+    if args.device == "cpu":
+        device = "cpu"
+    else:
+        device = "cuda"
+        multiprocessing.set_start_method('spawn') # 下面多进程fork模式会报错
 
-    # device
-    device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
-    # restore policy
-    policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=True)
+    # [新增] 自动创建 Video 目录
+    if args.video_path:
+        video_dir = os.path.dirname(args.video_path)
+        if video_dir and not os.path.exists(video_dir):
+            os.makedirs(video_dir, exist_ok=True)
+            print(f"Created video directory: {video_dir}")
+
+    # [新增] 自动创建 Log 目录
+    if args.log_dir:
+        if not os.path.exists(args.log_dir):
+            os.makedirs(args.log_dir, exist_ok=True)
+            print(f"Created log directory: {args.log_dir}")
+
+    # restore policy (只用来读 horizon，不用于多进程推理)
+    _, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=False)
 
     # read rollout settings
     rollout_num_episodes = args.n_rollouts
@@ -214,34 +489,76 @@ def run_trained_agent(args):
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    # maybe create video writer
-    video_writer = None
-    if write_video:
-        video_writer = imageio.get_writer(args.video_path, fps=20)
-
     # maybe open hdf5 to write rollouts
     write_dataset = (args.dataset_path is not None)
     if write_dataset:
+        # [新增] 自动创建 Dataset 目录
+        dataset_dir = os.path.dirname(args.dataset_path)
+        if dataset_dir and not os.path.exists(dataset_dir):
+            os.makedirs(dataset_dir, exist_ok=True)
+
         data_writer = h5py.File(args.dataset_path, "w")
         data_grp = data_writer.create_group("data")
         total_samples = 0
 
-    rollout_stats = []
-    for i in range(rollout_num_episodes):
-        stats, traj = rollout(
-            policy=policy, 
-            env=env, 
-            horizon=rollout_horizon, 
-            render=args.render, 
-            video_writer=video_writer, 
-            video_skip=args.video_skip, 
-            return_obs=(write_dataset and args.dataset_obs),
-            camera_names=args.camera_names,
-        )
-        rollout_stats.append(stats)
 
+
+    # ============== 修改核心部分 =================
+
+    # [新增] 使用 Manager().Queue() 进行跨进程通信
+    manager = multiprocessing.Manager()
+    msg_queue = manager.Queue()
+
+    # [新增] 启动后台线程监听并打印 Queue 里的消息
+    listener = threading.Thread(target=log_listener, args=(msg_queue,))
+    listener.daemon = True # 设置为守护线程，主程序退出时自动退出
+    listener.start()
+
+    # results = []
+
+    # device = cuda，需要考虑显存是否足够大？多进程的启动必须用spawn模式，防止继承父进程的上下文导致cuda报错
+    # device = cpu，需要考虑内存是否足够大？model是否小到cpu也可以推理？多进程的启动可以用fork模式 启动会快一点
+    num_workers = min(args.parallel, args.n_rollouts) 
+    print(f"Running evaluation with {num_workers} processes on {args.device.upper()}...")
+    print(f"Logs for each rollout will be saved in {args.log_dir}")
+
+    work_items = []
+    
+    for i in range(rollout_num_episodes):
+        curr_seed = args.seed + i if args.seed is not None else None
+        work_items.append((
+            ckpt_path, 
+            args.env, 
+            rollout_horizon, 
+            curr_seed, 
+            device,
+            (write_dataset and args.dataset_obs),
+            args.camera_names,
+            args.video_path, 
+            args.video_skip,
+            i,
+            args.log_dir,# [新增] 传入 log_dir          
+            msg_queue, # [新增] 传入 queue    
+            args.action_horizon, # [新增] 将命令行参数传入 Worker 
+            args.use_action_scheduler, # [NEW] Pass argument
+            args.use_ood_monitor       # [NEW] Pass argument
+        ))
+
+    with multiprocessing.Pool(num_workers) as pool:
+        results = pool.map(rollout_parallel_wrapper, work_items)
+
+    # 发送结束信号给监听线程（或者直接让它随主进程销毁）
+    msg_queue.put("KILL")
+    listener.join()
+
+
+    rollout_stats = []
+    # 过滤掉 None 结果 (crash 的任务)
+    valid_results = [r for r in results if r[0] is not None]
+
+    for i, (stats, traj) in enumerate(results):
+        rollout_stats.append(stats)
         if write_dataset:
-            # store transitions
             ep_data_grp = data_grp.create_group("demo_{}".format(i))
             ep_data_grp.create_dataset("actions", data=np.array(traj["actions"]))
             ep_data_grp.create_dataset("states", data=np.array(traj["states"]))
@@ -252,11 +569,12 @@ def run_trained_agent(args):
                     ep_data_grp.create_dataset("obs/{}".format(k), data=np.array(traj["obs"][k]))
                     ep_data_grp.create_dataset("next_obs/{}".format(k), data=np.array(traj["next_obs"][k]))
 
-            # episode metadata
             if "model" in traj["initial_state_dict"]:
-                ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
-            ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
+                ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"]
+            ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0]
             total_samples += traj["actions"].shape[0]
+
+    # ============== 修改结束 =================
 
     rollout_stats = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
     avg_rollout_stats = { k : np.mean(rollout_stats[k]) for k in rollout_stats }
@@ -264,13 +582,22 @@ def run_trained_agent(args):
     print("Average Rollout Stats")
     print(json.dumps(avg_rollout_stats, indent=4))
 
-    if write_video:
-        video_writer.close()
 
     if write_dataset:
-        # global metadata
-        data_grp.attrs["total"] = total_samples
-        data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
+        # 需要重新加载 env 才能 serialize 吗？
+        # env 变量在主进程中被释放了吗？如果不确定，可以重新加载一个 dummy env
+        # 或者在 worker 返回时带上 env info
+        # 这里假设 args.env 可用
+        try:
+             # 为了获取 env info，快速加载一个 dummy
+            dummy_env, _ = FileUtils.env_from_checkpoint(
+                ckpt_dict=ckpt_dict, env_name=args.env, render=False, verbose=False
+            )
+            data_grp.attrs["total"] = total_samples
+            data_grp.attrs["env_args"] = json.dumps(dummy_env.serialize(), indent=4)
+        except Exception as e:
+            print(f"Warning: Could not save env args to dataset: {e}")
+
         data_writer.close()
         print("Wrote dataset trajectories to {}".format(args.dataset_path))
 
@@ -290,7 +617,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_rollouts",
         type=int,
-        default=27,
+        default=50,
         help="number of rollouts",
     )
 
@@ -366,6 +693,41 @@ if __name__ == "__main__":
         default=None,
         help="(optional) set seed for rollouts",
     )
+
+    # added bu wuhao
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda"
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=4
+    )
+
+    # [新增] action_horizon 参数
+    parser.add_argument(
+        "--action_horizon",
+        type=int,
+        default=None,
+        help="(optional) override action execution horizon (Ta) defined in config",
+    )
+
+    # [NEW] Add these lines
+    parser.add_argument(
+        "--use_action_scheduler", 
+        action='store_true', 
+        help="enable action scheduler in Diffusion Policy"
+    )
+    parser.add_argument(
+        "--use_ood_monitor", 
+        action='store_true', 
+        help="enable OOD monitor in Diffusion Policy"
+    )
+
+    # [新增] log_dir 参数
+    parser.add_argument("--log_dir", type=str, default=None, help="directory to save log files (pkl and txt)")
 
     args = parser.parse_args()
     run_trained_agent(args)
