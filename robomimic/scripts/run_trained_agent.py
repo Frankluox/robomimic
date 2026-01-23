@@ -163,6 +163,13 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
 
     success = False # 初始化 success 变量，防止 horizon=0 时报错
 
+    # 统一停5空步，只用于delta action控制
+    dummy_action = np.array([0,0,0,0,0,0,0])
+    for _ in range(5):
+        next_obs, _, done, _ = env.step(dummy_action)
+        obs = deepcopy(next_obs)
+
+
     try:
         for step_i in range(horizon):
 
@@ -170,13 +177,11 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
             # get action from policy
             act = policy(ob=obs)
 
-            # print(act)
 
             # [新增] --- 数据记录逻辑开始 ---
             # 1. 获取图像
             # 需要 env.render (注意这可能会影响性能)
             image_to_log = None
-            # print(obs.keys())
 
             try:
                 # 无论 render 是否为 True，只要 render_offscreen 开启了就能渲染
@@ -389,7 +394,6 @@ def rollout_parallel_wrapper(args_tuple):
             return_obs=dataset_obs,
             camera_names=camera_names,
             rollout_id=index,
-            # log_dir="/home/wuhao/jobspace/robomimic/wuhao/logs" # 传入保存目录
             log_dir=log_dir, # 传入保存目录
             init_state=init_state
         )
