@@ -34,14 +34,6 @@ class ActionScheduler:
         # [新增] 初始化内部历史缓存
         self.prev_action_buffer: Optional[np.ndarray] = None
 
-    # def _apply_dct_noise_gate(self, dct_coeffs: np.ndarray) -> np.ndarray:
-    #     """
-    #     内部辅助函数：对 DCT 系数应用噪声门限，过滤微小的频率波动。
-    #     """
-    #     noise_floor = np.std(dct_coeffs) * self.dct_scale
-    #     # 将绝对值小于 noise_floor 的系数置为 0
-    #     mask = np.abs(dct_coeffs) > noise_floor
-    #     return dct_coeffs * mask
 
     def _apply_dct_noise_gate(self, dct_coeffs: np.ndarray) -> np.ndarray:
         """
@@ -89,14 +81,12 @@ class ActionScheduler:
         # 1. 计算 DCT (Type-II, 正交归一化)
         # axis=0: 对时间维度进行变换
         dct_coeffs = dct(data, type=2, norm='ortho', axis=0)
-        dct_coeffs = dct_coeffs
 
         # 2. 应用噪声门限并计算功率谱
         dct_coeffs_clean = self._apply_dct_noise_gate(dct_coeffs)
         power_spectrum = np.square(dct_coeffs_clean)
 
         cutoff_indices = []
-
         for d in range(D):
             p_d = power_spectrum[:, d]
             total_energy = np.sum(p_d)
@@ -204,12 +194,7 @@ class ActionScheduler:
             is_truncated: 是否发生了截断 (True/False)
             debug_info: 决策原因描述字符串
         """
-        # # 1. 拼接上下文以获得更准确的频率特征
-        # if prev_action is not None:
-        #     # 假设 prev_action 也是 (T', D)，通常只需拼接最后几帧即可，这里全拼
-        #     concat_act = np.concatenate([prev_action, current_action], axis=0)
-        # else:
-        #     concat_act = np.concatenate([current_action, current_action], axis=0) 
+
 
         # 1. [修改] 拼接逻辑：使用内部 self.prev_action_buffer
         if self.prev_action_buffer is not None:
@@ -225,9 +210,9 @@ class ActionScheduler:
         # q01 = np.array([-0.625, -0.57947, -0.79047, -0.08135263, -0.13670468, -0.44077774, -1])
         # q99 = np.array([1, 0.922, 1, 0.08800747, 0.18450282, 0.46038807, 1])
         # tool hang 参数 
-        q01 = array([-0.531     , -1.        , -0.86939   , -0.18211886, -0.24142542,
+        q01 = np.array([-0.531     , -1.        , -0.86939   , -0.18211886, -0.24142542,
             -0.38555725, -1.        ])
-        q99 = array([0.61439   , 1.        , 1.        , 0.11013618, 0.32159994,
+        q99 = np.array([0.61439   , 1.        , 1.        , 0.11013618, 0.32159994,
             0.47830307, 1.        ])
         
         concat_act = np.clip(concat_act, q01, q99)
