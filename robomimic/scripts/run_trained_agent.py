@@ -76,6 +76,9 @@ from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 
 # [新增] 定义一个只写文件的 Logger，强制刷新以防丢失日志
 class FileLogger(object):
@@ -527,7 +530,7 @@ def run_trained_agent(args):
     listener.daemon = True # 设置为守护线程，主程序退出时自动退出
     listener.start()
 
-    # results = []
+
 
     # device = cuda，需要考虑显存是否足够大？多进程的启动必须用spawn模式，防止继承父进程的上下文导致cuda报错
     # device = cpu，需要考虑内存是否足够大？model是否小到cpu也可以推理？多进程的启动可以用fork模式 启动会快一点
@@ -544,7 +547,6 @@ def run_trained_agent(args):
         assert len(init_states) >= args.n_rollouts, "Not enough initial states provided."
 
     work_items = []
-    
     for i in range(rollout_num_episodes):
         curr_seed = args.seed + i if args.seed is not None else None
 

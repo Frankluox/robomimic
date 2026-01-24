@@ -405,7 +405,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         else:
             if self.last_execution_info is not None:
                 self.last_execution_info["step_log"] = False
-        # print("Action queue length:", len(self.action_queue))
+        
         return self.action_queue.popleft().unsqueeze(0)
 
 
@@ -526,12 +526,6 @@ class DiffusionPolicyUNet(PolicyAlgo):
         noisy_action = torch.randn(
             (B, Tp, action_dim), device=self.device)
         naction = noisy_action
-
-        # np.set_printoptions(suppress=True)
-
-        # print("=================noise=============")
-        # print(np.round(naction.cpu().numpy(), 4))
-        # print("===============")
         
         # init scheduler
         self.noise_scheduler.set_timesteps(num_inference_timesteps)
@@ -544,9 +538,6 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 global_cond=obs_cond
             )
 
-            # print("=================noise_pred=============")
-            # print(np.round(noise_pred.cpu().numpy(), 4))
-            # print("===============")
 
             # inverse diffusion step (remove noise)
             naction = self.noise_scheduler.step(
@@ -556,10 +547,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
             ).prev_sample
 
         # process action using Ta
-        # Ta = 16
         start = To - 1
         end = start + Ta
-        # print(Ta)
         action = naction[:,start:end]
         return action
 
