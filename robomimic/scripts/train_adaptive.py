@@ -17,6 +17,8 @@ import numpy as np
 from collections import deque
 from datetime import datetime
 
+from stable_baselines3.common.monitor import Monitor
+
 # --- 新增：强制修复 robosuite 版本属性缺失问题 ---
 try:
     import robosuite
@@ -83,54 +85,51 @@ except ImportError:
 
 
 class SuccessBestModelCallback(BaseCallback):
-    def __init__(self, check_freq=2048, window_size=50, save_path='./best_model', verbose=0):
+    def __init__(self, check_freq, log_dir, ckpt_dir, window_size=50, verbose=1):
         super().__init__(verbose)
-        self.check_freq = check_freq
-        self.window_size = window_size
-        self.save_path = save_path
+        self.log_dir = log_dir
+        self.ckpt_dir = ckpt_dir
         self.best_success_rate = -1.0
-        
-        # 缓存数据
-        self.exec_lengths = []
         self.success_buffer = deque(maxlen=window_size)
-        
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
+        self.exec_lengths = []
+
+        # 确保目录存在
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.ckpt_dir, exist_ok=True)
 
     def _on_step(self) -> bool:
-        # 1. 记录每一步的执行长度 (来自 info)
+        # 1. 记录执行长度
         for info in self.locals["infos"]:
             if "exec_len" in info:
                 self.exec_lengths.append(info["exec_len"])
         
-        # 2. 记录每个回合是否成功 (来自 dones 和 info)
+        # 2. 统计成功率 (关键：从 info 获取 robosuite 的 success 标志)
         for i, done in enumerate(self.locals["dones"]):
             if done:
                 info = self.locals["infos"][i]
-                # 优先寻找环境原生 success 标志，没有则根据奖励判断
+                # 兼容性处理：优先找 info 里的 success，否则看 reward
                 is_success = info.get("success", self.locals["rewards"][i] > 0.5)
                 self.success_buffer.append(1 if is_success else 0)
         return True
 
     def _on_rollout_end(self) -> None:
-        # 记录执行长度
+        # 打印并记录到 TensorBoard
         if len(self.exec_lengths) > 0:
-            avg_len = np.mean(self.exec_lengths)
-            self.logger.record("adaptive/avg_exec_len", avg_len)
+            self.logger.record("adaptive/avg_exec_len", np.mean(self.exec_lengths))
             self.exec_lengths = []
-
-        # 计算并记录成功率
+        
         if len(self.success_buffer) > 0:
-            current_success_rate = np.mean(self.success_buffer)
-            self.logger.record("adaptive/success_rate_recent", current_success_rate)
+            current_sr = np.mean(self.success_buffer)
+            self.logger.record("adaptive/success_rate_recent", current_sr)
             
-            # --- 自动保存最优模型逻辑 ---
-            if current_success_rate > self.best_success_rate:
-                self.best_success_rate = current_success_rate
-                save_file = os.path.join(self.save_path, "best_success_model")
-                self.model.save(save_file)
+            # 如果成功率刷新纪录，保存 Best 模型
+            if current_sr > self.best_success_rate:
+                self.best_success_rate = current_sr
+                path = os.path.join(self.ckpt_dir, "best_model.zip")
+                self.model.save(path)
                 if self.verbose > 0:
-                    print(f"[INFO] 成功率提升至 {current_success_rate:.2f}，模型已保存至 {save_file}")
+                    print(f"New Best Success Rate: {current_sr:.2f}! Model saved to {path}")
+                    
 def train(args):
     # --- A. 设备与策略加载 ---
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
@@ -202,10 +201,13 @@ def train(args):
             render_offscreen=False,
             use_image_obs=False
         )
-        # 2. 包装成标准 Gym 环境，解决 ValueError
-        return RobomimicToGymWrapper(env)
-    
-    # 先创建串行向量环境
+        # 2. 包装成标准 Gym 环境
+        gym_env = RobomimicToGymWrapper(env)
+        
+        # 3. 核心修正：必须包装 Monitor 才能记录 ep_rew_mean 和 ep_len_mean
+        return Monitor(gym_env) 
+
+    # 然后再创建向量环境
     raw_venv = DummyVecEnv([make_raw_env for _ in range(args.n_envs)])
 
     venv = BatchedAdaptiveWrapper(
@@ -229,8 +231,9 @@ def train(args):
         gamma=args.gamma,
         gae_lambda=0.95,
         ent_coef=args.ent_coef, 
-        tensorboard_log=os.path.join(args.output, "tb_logs"),
-        device=device
+        # tensorboard_log=os.path.join(args.output, "tb_logs"),
+        device=device,
+        tensorboard_log=args.log_dir
     )
 
     # --- F. 回调与训练 ---
@@ -240,7 +243,10 @@ def train(args):
         name_prefix="adaptive_agent"
     )
 
-    adaptive_cb = SuccessBestModelCallback()
+    adaptive_cb = SuccessBestModelCallback(
+        check_freq=2048,
+        log_dir=args.log_dir,
+        ckpt_dir=args.ckpt_dir)
 
     print(f"[INFO] 开始 RL 训练。总步数: {args.total_timesteps}")
     model.learn(
