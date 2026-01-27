@@ -16,6 +16,9 @@ import robomimic.utils.tensor_utils as TensorUtils
 
 from stable_baselines3.common.vec_env import VecEnv
 
+import imageio
+import os
+
 
 class RobomimicToGymWrapper(gym.Env):
     def __init__(self, env):
@@ -32,10 +35,13 @@ class RobomimicToGymWrapper(gym.Env):
         obs, reward, done, info = self.env.step(action)
         return obs, reward, done, False, info
 
-    def render(self, mode="human"): return self.env.render(mode=mode)
+    # 修改后 (增加默认分辨率 512x512)
+    def render(self, mode="rgb_array", height=512, width=512): 
+        # Robomimic 环境的 render 接受 height 和 width 参数
+        return self.env.render(mode=mode, height=height, width=width)
 
 class BatchedAdaptiveWrapper(VecEnv):
-    def __init__(self, venv, policy, max_chunk_len, device, reward_offset=0.0, resample_penalty=-0.1):
+    def __init__(self, venv, policy, max_chunk_len, device, reward_offset=0.0, resample_penalty=-0.1, save_all_videos=False, video_dir=None):
         self.venv = venv
         self.num_envs = venv.num_envs
         self.policy = policy
@@ -69,35 +75,40 @@ class BatchedAdaptiveWrapper(VecEnv):
         self.current_chunks = [None] * self.num_envs
         self.actions_cache = None
 
-        # 在 BatchedAdaptiveWrapper 的 __init__ 中加入
-        print("-" * 30)
-        print("[DEBUG] Diffusion Policy 期望的输入键值 (Obs Keys):")
-        # self.algo_instance 是之前代码里拿到的 policy.policy
-        for key in self.algo_instance.obs_shapes.keys():
-            print(f"Key: {key}, Shape: {self.algo_instance.obs_shapes[key]}")
-        print("-" * 30)
+        self.env_steps = [0] * self.num_envs
+        self.max_steps = 600 # 对应你在 train_adaptive.py 里的设置
+
+        # --- 新增视频录制相关变量 ---
+        self.save_all_videos = save_all_videos
+        self.video_dir = video_dir
+        # 为每个环境独立维护帧缓冲区
+        self.episode_frames = [[] for _ in range(self.num_envs)]
+        self.episode_counts = [0] * self.num_envs
+        
+        if self.save_all_videos and self.video_dir:
+            os.makedirs(self.video_dir, exist_ok=True)
+
+        self.episode_success_flags = [False] * self.num_envs
 
     def _get_obs_vec(self, obs_dict):
-        """
-        同步 DP 模型视野：将 44 维的 object 信息加入 RL 观测
-        """
-        # 定义核心物理状态键值
-        target_keys = [
-            'robot0_eef_pos',      # [3]
-            'robot0_eef_quat',     # [4]
-            'robot0_gripper_qpos', # [2]
-            'object'               # [44] <- 核心情报补完
-        ]
+        # 显式定义每个 Key 对应的维度，确保即使缺失也能补齐
+        # 这里的维度需要根据你的环境 metadata 确定
+        key_shapes = {
+            'robot0_eef_pos': (3,),
+            'robot0_eef_quat': (4,),
+            'robot0_gripper_qpos': (2,),
+            'object': (44,) 
+        }
         
         vecs = []
-        for k in target_keys:
+        for k, shape in key_shapes.items():
             if k in obs_dict:
                 val = obs_dict[k]
-                # 展平并确保是 float32
                 vecs.append(val.flatten().astype(np.float32))
             else:
-                # 容错：如果某个 Key 没拿到，打印警告（仅限初期调试）
-                pass 
+                # 【核心修复】：如果 Key 缺失，填充对应维度的零向量，而不是跳过
+                print(f"[WARNING] Observation key '{k}' missing! Padding with zeros.")
+                vecs.append(np.zeros(shape, dtype=np.float32))
                 
         return np.concatenate(vecs)
 
@@ -112,6 +123,7 @@ class BatchedAdaptiveWrapper(VecEnv):
         """
         核心修复：使用源码中存在的 list_of_flat_dict_to_dict_of_list 手动实现 Batching
         """
+        torch.cuda.empty_cache()
         valid_keys = list(self.algo_instance.obs_shapes.keys())
         
         if isinstance(obs_data, list):
@@ -139,10 +151,21 @@ class BatchedAdaptiveWrapper(VecEnv):
         with torch.no_grad():
             # 调用 Diffusion Policy 得到动作轨迹 [Batch, Horizon, Action_Dim]
             raw_actions = self.algo_instance._get_action_trajectory(batch_obs)
-            return raw_actions.detach().cpu().numpy()
+            actions_np = raw_actions.detach().cpu().numpy()
+            
+            # # --- 探针 A ---
+            # print(f"[PROBE-A] Model Output Shape: {actions_np.shape}, Expected: (Batch, 16, Dim)")
+            return actions_np
 
     def reset(self):
         obs_batch = self.venv.reset()
+        # --- 【修复黑屏】：在第一次 Reset 时强行渲染一帧，唤醒 OpenGL 上下文 ---
+        if self.save_all_videos:
+            for i in range(self.num_envs):
+                _ = self.venv.envs[i].render(mode="rgb_array", height=160, width=160)
+        # 打印每个环境抓取的物体坐标（以 'object' 为例，具体 key 视环境而定）
+        # print(f"[DEBUG] Reset 初始物体状态 (Env 0): {obs_batch['robot0_eef_pos'][0]}")
+        # eef_pos = raw_obs.get('robot0_eef_pos')
         batch_chunks = self._get_batch_policy_plan(obs_batch)
         self.current_obs_dicts = [{k: v[i] for k, v in obs_batch.items()} for i in range(self.num_envs)]
         self.current_chunks = [batch_chunks[i] for i in range(self.num_envs)]
@@ -160,6 +183,15 @@ class BatchedAdaptiveWrapper(VecEnv):
         # 1. 执行周期：物理环境跑 k 步
         for i in range(self.num_envs):
             k = int(actions[i])
+
+            # # --- 探针 B ---
+            current_buffer = self.current_chunks[i]
+            buffer_len = len(current_buffer) if current_buffer is not None else -1
+            # print(f"[PROBE-B] Env {i} | Requested k: {k} | Buffer Type: {type(current_buffer)} | Buffer Len: {buffer_len}")
+            
+            if k > 0 and (current_buffer is None or buffer_len < k):
+                print(f"!!! [CRITICAL] Env {i} 出现异常：RL 请求执行 {k} 步，但缓冲区只有 {buffer_len} 步！")
+                # 这里可以加个断点或强制打印出 buffer 的内容
             
             # 场景 A：RL 选了重采样 (k=0)
             if k == 0:
@@ -169,33 +201,147 @@ class BatchedAdaptiveWrapper(VecEnv):
             
             # 场景 B：执行 k 步物理步
             steps_actually_run = 0
+            # 【探针变量】：专门用来锁定包含统计信息的 info
+            # captured_episode_info = None
+            last_sub_info = {}
+            # last_info = {} # 用于保存最后一步的 info
             # 注意：此时 current_chunks[i] 是上一轮决策后生成的全新 16 步
-            for _ in range(k):
-                # 理论上 current_chunks 不会在此为空，但做个稳健性检查
+            for step_idx in range(k):
+                # --- 探针 C ---
                 if len(self.current_chunks[i]) == 0:
+                    print(f"!!! [ERROR] 崩溃点：Env {i} 物理循环第 {step_idx}/{k} 步时 Chunk 空了")
+                    # 重点查看：此时的 step_idx 是多少？如果 step_idx < k，说明确实没给够
                     break
+                # # 理论上 current_chunks 不会在此为空，但做个稳健性检查
+                # if len(self.current_chunks[i]) == 0:
+                #     print("!!! [ERROR] 当前动作块已空，无法继续执行！")
+                #     break
                 
                 act = self.current_chunks[i][0]
                 self.current_chunks[i] = self.current_chunks[i][1:] # 消耗一个动作
+
                 
-                next_obs, r, d, _, _ = self.venv.envs[i].step(act)
+                next_obs, r, d, truncated, sub_info = self.venv.envs[i].step(act)
+
+                # --- 【核心修改】：在物理步内捕获每一帧，确保视频丝滑 ---
+                if self.save_all_videos:
+                    # 获取当前物理帧 (需要 render_offscreen=True)
+                    frame = self.venv.envs[i].render(mode="rgb_array", height=160, width=160)
+                    self.episode_frames[i].append(frame)
+
+
+                self.env_steps[i] += 1 # 物理步计数
+                last_sub_info = sub_info
+
+                # # --- 探针 1：实时监控 Monitor 信号 ---
+                # if 'episode' in sub_info:
+                #     print(f"!!! [探针-发现信号] Env {i} 在物理步 {self.env_steps[i]} 产生 episode 数据: {sub_info['episode']}")
+                #     captured_episode_info = sub_info.copy() # 立即锁定，防止被下一帧覆盖
+
+                # # 每一百步打印一次心跳，确认环境还在跑，并观察步数是否超标
+                # if self.env_steps[i] % 20 == 0:
+                #     print(f"[HEARTBEAT] Env {i} Step: {self.env_steps[i]}, Done: {d}, Reward: {r}")
+
+
+                # if d or truncated:
+                #     dones[i] = True
+                #     self.env_steps[i] = 0 # 重置计数
+
+
+                # if d:
+                #     print(f"!!! [SUCCESS/DONE] 底层环境 i={i} 触发了 done! Reward: {r}, Info keys: {sub_info.keys()}")
+                #     if 'episode' in sub_info:
+                #         print(f">>> Monitor 数据已生成: {sub_info['episode']}")
+                # # ---------------------
+
+                # if truncated:
+                #     print(f"!!! [TRUNCATED] 底层环境 i={i} 触发了 truncated! Reward: {r}, Info keys: {sub_info.keys()}")
+                #     if 'episode' in sub_info:
+                #         print(f">>> Monitor 数据已生成: {sub_info['episode']}")
+
+                #### debug#### debug#### debug
+
+
+
                 rewards[i] += (r - self.reward_offset)
                 self.current_obs_dicts[i] = next_obs # 更新该环境的最新观测
                 steps_actually_run += 1
-                
-                if d:
+
+                # 【核心改进】：检测成功并提前终止
+                # 检查 reward 是否达到 1.0 或者 info 里是否有 success 标志
+                is_success = False
+                if r >= 1.0:
+                    is_success = True
+                elif isinstance(sub_info.get('is_success'), dict):
+                    is_success = sub_info['is_success'].get('task', False)
+                elif sub_info.get('success'):
+                    is_success = True
+
+                if is_success:
+                #     print(f"!!! [SUCCESS EARLY EXIT] Env {i} 在第 {self.env_steps[i]} 步成功，提前终止回合")
+                    self.episode_success_flags[i] = True # 标记该回合已成功
+                    d = True # 强行设为 done
+
+
+                # 3. 检查是否达到最大步数 (600步)
+                if self.env_steps[i] >= self.max_steps:
+                    # print(f"!!! [FORCE DONE] Env {i} 达到手动上限 {self.max_steps}")
+                    d = True
+                    truncated = True
+
+                # 回合结束处理
+                if d or truncated:
                     dones[i] = True
+                    # --- 【核心修改】：轨迹结束，保存该环境的视频 ---
+                    if self.save_all_videos and len(self.episode_frames[i]) > 0:
+                        self._save_video(i, success=self.episode_success_flags[i])
+                    # 关键：保存完视频后，重置该环境的成功标志
+                    self.episode_success_flags[i] = False
                     break
+
+
+
+                # last_info = sub_info # 持续更新，保留最后一步包含 Monitor 数据的 info
+                
+                # if d or truncated:
+                #     dones[i] = True
+                #     break
+
+            # # --- 探针 2：验证数据合并 ---
+            # if captured_episode_info:
+            #     # 确保把抓到的核心数据更新进去
+            #     infos[i].update(captured_episode_info)
+            # else:
+            #     if dones[i]:
+            #         print(f"??? [探针-异常] Env {i} 回合已结束，但全程未抓到 'episode' 键！sub_info 所有键: {sub_info.keys()}")
+
+            infos[i].update(last_sub_info)
+            # 清洗 is_success (防止上一轮报错)
+            if 'is_success' in infos[i] and isinstance(infos[i]['is_success'], dict):
+                infos[i]['is_success'] = infos[i]['is_success'].get('task', False)
             
-            infos[i] = {"exec_len": steps_actually_run, "resampled": False}
+            # 【关键修复】：合并底层 info，确保 Monitor 的 episode 数据能传给 PPO
+            # infos[i].update(last_info)
+
+
+            infos[i].update({"exec_len": steps_actually_run, "resampled": False})
+
+            
 
         # 2. 核心逻辑：强制抛弃剩余计划，全员刷新 (MPC 模式)
         needs_new = []
         for i in range(self.num_envs):
             if dones[i]:
+                # 重置计数器
+                self.env_steps[i] = 0
                 # 环境结束，手动重置环境获取初始状态
                 raw_obs, _ = self.venv.envs[i].reset()
                 self.current_obs_dicts[i] = raw_obs
+
+                # --- 在这里加上打印 ---
+                # obj_pos = raw_obs.get('object', np.array([0,0,0]))[:3]
+                # eef_pos = raw_obs.get('robot0_eef_pos')
+                # print(f"[DEBUG] 轨迹结束，自动重置 Env {i}。新物体位置: {eef_pos}")
             
             # 重点：无论刚才跑了多少步，为了实现“每步重决策”，
             # 我们将所有环境加入 needs_new 列表进行全量重采样
@@ -215,186 +361,39 @@ class BatchedAdaptiveWrapper(VecEnv):
             self._make_rl_obs(self.current_obs_dicts[i], self.current_chunks[i]) 
             for i in range(self.num_envs)
         ])
+
+        # # --- 探针 3：最终输出前检查 ---
+        # if any(dones):
+        #     for i, info in enumerate(infos):
+        #         if dones[i]:
+        #             has_ep = 'episode' in info
+        #             print(f"[最终检查] Env {i} 准备提交给 PPO: Done={dones[i]}, 包含 episode={has_ep}")
         
         return next_rl_obs, rewards, dones, infos
+
+    def _save_video(self, env_idx, success=False):
+        """内部辅助函数：保存视频并清空缓存"""
+        self.episode_counts[env_idx] += 1
+        # 根据成功与否添加后缀
+        status_str = "success" if success else "fail"
+        filename = f"env_{env_idx}_ep_{self.episode_counts[env_idx]:03d}_{status_str}.mp4"
+        path = os.path.join(self.video_dir, filename)
+        
+        try:
+            # fps=20 对应 robosuite 的标准速度，看起来比较自然
+            imageio.mimsave(path, self.episode_frames[env_idx], fps=20)
+        except Exception as e:
+            print(f"[ERROR] 保存视频失败: {e}")
+            
+        # 必须清空，否则内存会爆
+        self.episode_frames[env_idx] = []
+
+    # 为了 SB3 兼容性，确保 render 请求能透传
+    def render(self, mode="rgb_array", height=512, width=512):
+        return self.venv.render(mode=mode, height=height, width=width)
 
     def close(self): self.venv.close()
     def get_attr(self, a, i=None): return self.venv.get_attr(a, i)
     def set_attr(self, a, v, i=None): return self.venv.set_attr(a, v, i)
     def env_method(self, m, *as_, indices=None, **ks): return self.venv.env_method(m, *as_, indices=indices, **ks)
     def env_is_wrapped(self, w, i=None): return [False] * self.num_envs
-
-class AdaptiveChunkingWrapper(gym.Env):
-    def __init__(self, env, policy, max_chunk_len, device, reward_offset=0.0, resample_penalty=-0.1):
-        """
-        Args:
-            env: 原始 Robomimic 环境 (step返回 obs_dict)
-            policy: 预训练好的 Diffusion Policy (frozen)
-            max_chunk_len: N, Diffusion Policy 输出的最大长度
-            resample_penalty: 当 RL 选择 k=0 (重采样) 时的惩罚值
-        """
-        self.env = env
-        self.policy = policy
-        self.max_chunk_len = max_chunk_len
-        self.device = device
-        self.reward_offset = reward_offset
-        self.resample_penalty = resample_penalty
-
-        # 定义需要拼接的 Observation Keys
-        self.target_obs_keys = ['robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos']
-        
-        # 1. Action Space: 0 到 N (共 N+1 个离散动作)
-        # 0: 重采样, 1-N: 执行对应步数
-        self.action_space = spaces.Discrete(max_chunk_len + 1)
-        
-        # 2. Observation Space: [Flat_Obs, Flat_Action_Chunk]
-        # 先获取一次 obs 看看维度
-        raw_obs = self.env.reset()
-        # print(f"[AdaptiveChunkingWrapper] 原始 Obs Keys: {list(tmp_obs.keys())}")
-        # 兼容处理 reset 返回 (obs, info) 的情况
-        if isinstance(raw_obs, tuple):
-            raw_obs = raw_obs[0]
-        obs_vec = self._get_obs_vec(raw_obs)
-        self.obs_dim = obs_vec.shape[0]
-
-        #
-        # 注意：这里 policy 可能是 RolloutPolicy，也可能是算法实例
-        # 我们的 train_adaptive.py 已经处理了 RolloutPolicy，这里直接用 ac_dim
-        if hasattr(policy, 'ac_dim'):
-            self.action_dim = policy.ac_dim
-        else:
-            self.action_dim = policy.policy.ac_dim
-
-        self.chunk_flat_dim = max_chunk_len * self.action_dim
-        
-        self.total_obs_dim = self.obs_dim + self.chunk_flat_dim
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.total_obs_dim,), dtype=np.float32
-        )
-        
-        self.current_obs_dict = raw_obs
-        self.current_chunk = None # shape (T, Da)
-
-    def _get_obs_vec(self, obs_dict):
-        """
-        辅助函数：将特定的 observation keys 拼接成一个扁平的向量。
-        """
-        # 按照 target_obs_keys 的顺序拼接向量
-        vecs = []
-        for k in self.target_obs_keys:
-            if k in obs_dict:
-                val = obs_dict[k]
-                # 确保是 1D 数组
-                if isinstance(val, np.ndarray):
-                    vecs.append(val.flatten())
-                else:
-                    # 处理 scalar 的情况
-                    vecs.append(np.array([val]))
-            else:
-                raise KeyError(f"Observation key '{k}' not found in environment output! Available keys: {list(obs_dict.keys())}")
-        
-        return np.concatenate(vecs).astype(np.float32)
-
-    def _get_policy_plan(self, obs_dict):
-        """调用 Frozen Policy 生成 Action Chunk"""
-        # 预处理 obs
-        obs_dict = TensorUtils.to_tensor(obs_dict)
-        obs_dict = TensorUtils.to_batch(obs_dict) # [B, ...]
-        obs_dict = TensorUtils.to_device(obs_dict, self.device)
-        obs_dict = TensorUtils.to_float(obs_dict)
-        
-        with torch.no_grad():
-            # 使用 _get_action_trajectory 获取完整序列
-            # 注意：需要确保 policy 处于 eval 模式，但如果为了重采样需要随机性，
-            # Diffusion Policy 本身的去噪过程是随机的，所以每次调用都会不同。
-
-            # 如果是 RolloutPolicy，调用其内部的 .policy 属性
-            if hasattr(self.policy, 'policy'):
-                raw_action = self.policy.policy._get_action_trajectory(obs_dict)
-            else:
-                raw_action = self.policy._get_action_trajectory(obs_dict)
-            # raw_action = self.policy._get_action_trajectory(obs_dict)
-            raw_action = raw_action.detach().cpu().numpy()[0] # [T, Da]
-            
-        return raw_action
-
-    def _make_rl_obs(self, obs_dict, action_chunk):
-        """拼接拼接后的 Obs 向量和 Chunk 作为 RL 的输入"""
-        obs_vec = self._get_obs_vec(obs_dict)
-
-        # 如果 chunk 长度不足 N (虽然 diffusion 一般是固定的)，padding 0
-        current_len = action_chunk.shape[0]
-        if current_len < self.max_chunk_len:
-            padding = np.zeros((self.max_chunk_len - current_len, self.action_dim))
-            action_chunk = np.concatenate([action_chunk, padding], axis=0)
-        
-        flat_chunk = action_chunk.flatten()
-        return np.concatenate([obs_vec, flat_chunk]).astype(np.float32)
-
-    def reset(self, **kwargs):
-        raw_obs = self.env.reset()
-        if isinstance(raw_obs, tuple):
-            raw_obs = raw_obs[0]
-
-        self.current_obs_dict = raw_obs
-        
-        # 初始推理
-        self.current_chunk = self._get_policy_plan(self.current_obs_dict)
-
-        rl_obs = self._make_rl_obs(self.current_obs_dict, self.current_chunk)
-        
-        # === 核心修正：返回 (观测, 信息字典) ===
-        return rl_obs, {}
-
-    def step(self, action):
-        k = int(action) # RL 输出的长度
-        
-        # === Case 0: Resample (重采样) ===
-        if k == 0:
-            # 给予惩罚，强制策略去寻找更好的 chunk 或者学会执行
-            reward = self.resample_penalty
-            terminated = False # 对应原本的 done
-            truncated = False  # 新增的截断标志
-            info = {"exec_len": 0, "resampled": True}
-            
-            # 环境状态不变，但重新请求 Policy 生成新的 Chunk
-            # Diffusion Policy 的生成过程包含随机噪声，所以结果会变
-            self.current_chunk = self._get_policy_plan(self.current_obs_dict)
-            
-            # 返回：旧的 Obs + 新的 Chunk
-            rl_obs = self._make_rl_obs(self.current_obs_dict, self.current_chunk)
-            # 返回 5 个值
-            return rl_obs, reward, terminated, truncated, info
-
-        # === Case > 0: Execute k steps (执行 k 步) ===
-        total_reward = 0
-        terminated = False
-        truncated = False
-        info = {"exec_len": k, "resampled": False}
-        
-        # 截取前 k 步
-        # 注意边界检查，虽然理论上 RL 不会输出 > N，但防止万一
-        steps_to_run = min(k, len(self.current_chunk))
-        
-        for i in range(steps_to_run):
-            act = self.current_chunk[i]
-            next_obs, r, d, _ = self.env.step(act)
-            
-            # 累加奖励 (包含 reward_offset)
-            total_reward += (r - self.reward_offset)
-            self.current_obs_dict = next_obs
-            
-            if d:
-                done = True
-                break
-        
-        # 只有当环境没结束时，才进行下一次推理
-        if not terminated:
-            self.current_chunk = self._get_policy_plan(self.current_obs_dict)
-            rl_obs = self._make_rl_obs(self.current_obs_dict, self.current_chunk)
-        else:
-            # 环境结束，给个全0的chunk占位，外部会调用reset
-            dummy_chunk = np.zeros((self.max_chunk_len, self.action_dim))
-            rl_obs = self._make_rl_obs(self.current_obs_dict, dummy_chunk)
-
-        return rl_obs, total_reward, terminated, truncated, info

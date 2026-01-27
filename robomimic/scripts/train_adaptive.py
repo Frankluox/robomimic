@@ -6,18 +6,20 @@
 
 
 
-import multiprocessing
-multiprocessing.set_start_method('fork', force=True)
 
 import argparse
 import sys
 import os
 import torch
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 import numpy as np
 from collections import deque
 from datetime import datetime
 
-from stable_baselines3.common.monitor import Monitor
+# from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import VecMonitor # 导入 VecMonitor
+from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import VecVideoRecorder # 导入视频记录器
 
 # --- 新增：强制修复 robosuite 版本属性缺失问题 ---
 try:
@@ -68,18 +70,36 @@ import robomimic.utils.env_utils as EnvUtils
 
 # 导入你写的 Wrapper
 try:
-    from wuhao.adaptive_env_utils import AdaptiveChunkingWrapper, BatchedAdaptiveWrapper, RobomimicToGymWrapper
+    from wuhao.adaptive_env_utils import BatchedAdaptiveWrapper, RobomimicToGymWrapper
     print("[INFO] 成功从 wuhao 模块导入 AdaptiveChunkingWrapper")
 except ImportError:
     # 备选路径：如果脚本在 robomimic/scripts
     sys.path.append(os.path.abspath(os.path.join(current_dir, "../../")))
     try:
-        from wuhao.adaptive_env_utils import AdaptiveChunkingWrapper, BatchedAdaptiveWrapper, RobomimicToGymWrapper
+        from wuhao.adaptive_env_utils import BatchedAdaptiveWrapper, RobomimicToGymWrapper
         print("[INFO] 成功通过备选路径导入 AdaptiveChunkingWrapper")
     except ImportError:
         print(f"[ERROR] 无法找到 wuhao.adaptive_env_utils。请检查文件是否存在。")
         sys.exit(1)
 
+
+
+from typing import Callable
+
+import json
+
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    """
+    线性学习率调度器。
+    :param initial_value: 初始学习率。
+    :return: 接受当前进度（1.0 到 0.0）并返回对应学习率的函数。
+    """
+    def func(progress_remaining: float) -> float:
+        """
+        progress_remaining 从 1.0 逐渐变为 0.0
+        """
+        return progress_remaining * initial_value
+    return func
 
 
 
@@ -92,44 +112,83 @@ class SuccessBestModelCallback(BaseCallback):
         self.best_success_rate = -1.0
         self.success_buffer = deque(maxlen=window_size)
         self.exec_lengths = []
+        
+        # --- 新增：用于存储指标历史的字典 ---
+        self.history = {
+            "timesteps": [],
+            "metrics": {}
+        }
+        self.json_path = os.path.join(log_dir, "training_metrics.json")
 
-        # 确保目录存在
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
     def _on_step(self) -> bool:
-        # 1. 记录执行长度
+        # 记录执行长度
         for info in self.locals["infos"]:
             if "exec_len" in info:
                 self.exec_lengths.append(info["exec_len"])
         
-        # 2. 统计成功率 (关键：从 info 获取 robosuite 的 success 标志)
+        # 统计成功率
         for i, done in enumerate(self.locals["dones"]):
             if done:
                 info = self.locals["infos"][i]
-                # 兼容性处理：优先找 info 里的 success，否则看 reward
-                is_success = info.get("success", self.locals["rewards"][i] > 0.5)
+                raw_success = info.get("is_success", False)
+                if isinstance(raw_success, dict):
+                    is_success = raw_success.get("task", False)
+                else:
+                    is_success = bool(raw_success)
                 self.success_buffer.append(1 if is_success else 0)
         return True
 
     def _on_rollout_end(self) -> None:
-        # 打印并记录到 TensorBoard
+        # 1. 记录自定义指标到 TensorBoard
         if len(self.exec_lengths) > 0:
-            self.logger.record("adaptive/avg_exec_len", np.mean(self.exec_lengths))
+            avg_exec = np.mean(self.exec_lengths)
+            self.logger.record("adaptive/avg_exec_len", avg_exec)
             self.exec_lengths = []
         
         if len(self.success_buffer) > 0:
             current_sr = np.mean(self.success_buffer)
             self.logger.record("adaptive/success_rate_recent", current_sr)
             
-            # 如果成功率刷新纪录，保存 Best 模型
             if current_sr > self.best_success_rate:
                 self.best_success_rate = current_sr
                 path = os.path.join(self.ckpt_dir, "best_model.zip")
                 self.model.save(path)
+                # 【核心修复】：同步保存 VecNormalize 统计量
+                # 我们需要从 venv 中找到 VecNormalize 层
+                if isinstance(self.training_env, VecNormalize):
+                    print("[INFO] 保存 VecNormalize 统计量...")
+                    self.training_env.save(os.path.join(self.ckpt_dir, "best_vec_normalize.pkl"))
+                else:
+                    print("[WARNING] 训练环境不是 VecNormalize，无法保存统计量。")
                 if self.verbose > 0:
                     print(f"New Best Success Rate: {current_sr:.2f}! Model saved to {path}")
+
+        # 2. --- 新增：捕获所有 Logger 指标并保存为 JSON ---
+        self.history["timesteps"].append(self.num_timesteps)
+        # 遍历当前 Logger 中所有的标量值 (包括 PPO 的 loss, reward 等)
+        for key, value in self.logger.name_to_value.items():
+            if key not in self.history["metrics"]:
+                self.history["metrics"][key] = []
+            self.history["metrics"][key].append(float(value))
+
+        # 实时写入 JSON，防止崩溃丢失数据
+        with open(self.json_path, "w") as f:
+            json.dump(self.history, f, indent=4)
                     
+
+def make_raw_env(env_meta, render_offscreen=False):
+    # 包装 Robomimic 原始环境
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=env_meta,
+        render=False,
+        render_offscreen=render_offscreen, 
+        use_image_obs=False
+    )
+    return RobomimicToGymWrapper(env)
+
 def train(args):
     # --- A. 设备与策略加载 ---
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
@@ -148,6 +207,21 @@ def train(args):
     # 我们需要对内部的算法对象调用 eval() 和 requires_grad_(False)
     algo_instance = policy.policy 
 
+    # 1. 强制解锁配置并对齐 Horizon
+    # 获取模型训练时设定的预测长度 (通常是 16)
+    pred_h = algo_instance.algo_config.horizon.prediction_horizon
+
+    with algo_instance.algo_config.values_unlocked():
+        # 将输出长度强行设为预测长度
+        algo_instance.algo_config.horizon.action_horizon = pred_h
+        print(f"[INFO] 已将 algo_config.action_horizon 从 {algo_instance.algo_config.horizon.action_horizon} 强制修改为 {algo_instance.algo_config.horizon.action_horizon}")
+
+    # 2. 【最关键一步】：同步更新实例属性
+    # Robomimic 的 DiffusionPolicy 在运行中通常直接引用 self.ac_horizon
+    if hasattr(algo_instance, 'ac_horizon'):
+        algo_instance.ac_horizon = pred_h
+        print(f"[SUCCESS] 已强制覆盖 algo_instance.ac_horizon 为 {algo_instance.ac_horizon}")
+
     algo_instance.nets.eval() # 锁定网络中的 BatchNorm/Dropout
     for param in algo_instance.nets.parameters():
         param.requires_grad = False # 彻底锁定参数
@@ -165,7 +239,7 @@ def train(args):
     env_meta = ckpt_dict["env_metadata"]
     
     # --- 新增：强制设置最大执行步数为 600 ---
-    env_meta["env_kwargs"]["horizon"] = 600 
+    env_meta["env_kwargs"]["horizon"] = 600
     print(f"[INFO] 强制设置环境最大步数 (Horizon) 为: {env_meta['env_kwargs']['horizon']}")
     
     # --- C. 定义环境工厂 (针对 SB3 向量化) ---
@@ -193,22 +267,32 @@ def train(args):
     #     return env
 
     # 1. 首先创建一个普通的 DummyVecEnv，里面只有原始的 Robomimic 环境
-    def make_raw_env():
-        # 1. 创建 Robomimic 原始环境
-        env = EnvUtils.create_env_from_metadata(
-            env_meta=env_meta,
-            render=False,
-            render_offscreen=False,
-            use_image_obs=False
-        )
-        # 2. 包装成标准 Gym 环境
-        gym_env = RobomimicToGymWrapper(env)
+    # def make_raw_env():
+    #     # 1. 创建 Robomimic 原始环境
+    #     env = EnvUtils.create_env_from_metadata(
+    #         env_meta=env_meta,
+    #         render=False,
+    #         render_offscreen=False,
+    #         use_image_obs=False
+    #     )
+    #     # 2. 包装成标准 Gym 环境
+    #     gym_env = RobomimicToGymWrapper(env)
         
-        # 3. 核心修正：必须包装 Monitor 才能记录 ep_rew_mean 和 ep_len_mean
-        return Monitor(gym_env) 
+    #     # 3. 核心修正：必须包装 Monitor 才能记录 ep_rew_mean 和 ep_len_mean
+    #     # return Monitor(gym_env) 
+    #     return gym_env 
+
+    from functools import partial
+
+
+    # 1. 设置视频文件夹路径到 logs 目录下
+    video_dir = os.path.join(args.log_dir, "videos") if args.save_videos else None
+    # 2. 这里的 offscreen 必须为 True 才能拿到画面
+    offscreen = True if args.save_videos else False
+    env_fn = partial(make_raw_env, env_meta, render_offscreen=offscreen)
 
     # 然后再创建向量环境
-    raw_venv = DummyVecEnv([make_raw_env for _ in range(args.n_envs)])
+    raw_venv = DummyVecEnv([env_fn for _ in range(args.n_envs)])
 
     venv = BatchedAdaptiveWrapper(
         venv=raw_venv,
@@ -216,15 +300,26 @@ def train(args):
         max_chunk_len=args.max_chunk_len,
         device=device,
         reward_offset=args.reward_offset,
-        resample_penalty=args.resample_penalty
+        resample_penalty=args.resample_penalty,
+        save_all_videos=args.save_videos, # 开启录制
+        video_dir=video_dir               # 传入路径
     )
+
+    # 4. 【核心修复】：在最外层包装 VecMonitor
+    # 这样 VecMonitor 就能看到你 Wrapper 返回的每一个 done=True 和 reward
+    venv = VecMonitor(venv)
+    venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=10.)
+
+
+
+    lr_schedule = linear_schedule(args.lr)
 
     # --- E. 配置 PPO 模型 ---
     model = PPO(
         "MlpPolicy",
         venv,
         verbose=1,
-        learning_rate=args.lr,
+        learning_rate=lr_schedule,  # 【修改点】：传入函数而非固定值
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         n_epochs=10,
@@ -244,9 +339,11 @@ def train(args):
     )
 
     adaptive_cb = SuccessBestModelCallback(
-        check_freq=2048,
+        check_freq=args.n_steps, # 虽然没用到，但保持与采样步数一致较好
         log_dir=args.log_dir,
-        ckpt_dir=args.ckpt_dir)
+        ckpt_dir=args.ckpt_dir,
+        window_size=args.window_size # 从 args 传入
+    )
 
     print(f"[INFO] 开始 RL 训练。总步数: {args.total_timesteps}")
     model.learn(
@@ -262,6 +359,9 @@ def train(args):
     venv.close()
 
 if __name__ == "__main__":
+    # 3. 将 'fork' 改为 'spawn'
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--agent", type=str, required=True, help="预训练模型 (.pth) 路径")
@@ -285,6 +385,11 @@ if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     parser.add_argument("--log_dir", type=str, default=f"logs/run_{timestamp}")
     parser.add_argument("--ckpt_dir", type=str, default=f"checkpoints/run_{timestamp}")
+
+    # 视频与 JSON 保存开关
+    parser.add_argument("--window_size", type=int, default=50, help="计算平均成功率的窗口大小")
+    parser.add_argument("--save_videos", action="store_true", help="是否保存视频")
+    parser.add_argument("--video_freq", type=int, default=10000, help="多少步录制一个视频")
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
