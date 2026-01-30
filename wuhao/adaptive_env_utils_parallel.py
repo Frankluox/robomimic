@@ -19,6 +19,7 @@ from stable_baselines3.common.vec_env import VecEnv
 import imageio
 import os
 import torch.nn as nn
+import collections # 顶部增加导入
 
 
 class RobomimicToGymWrapper(gym.Env):
@@ -43,15 +44,17 @@ class RobomimicToGymWrapper(gym.Env):
 # =============================================================================
 # 新增：运行在子进程中的内部包装器
 # 功能：接收 Chunk 和 k，自主循环执行，执行完后物理时钟自动停止
+# Modified: Internal wrapper supporting Gamma Discounting
 # =============================================================================
 class InternalVariableChunkWrapper(gym.Wrapper):
-    def __init__(self, env, reward_offset=0.0, max_steps=600, save_videos=False, video_dir=None, env_id=0):
+    def __init__(self, env, reward_offset=0.0, max_steps=600, save_videos=False, video_dir=None, env_id=0, gamma=0.99):
         super().__init__(env)
         self.reward_offset = reward_offset
         self.max_steps = max_steps
         self.save_videos = save_videos
         self.video_dir = video_dir
         self.env_id = env_id  # 用于区分不同进程的文件名
+        self.gamma = gamma  # <--- [SMDP] Receive Gamma
 
         self.current_step = 0
         self.episode_count = 0
@@ -71,82 +74,137 @@ class InternalVariableChunkWrapper(gym.Wrapper):
         return obs, info
 
     def step(self, action_data):
-        chunk = action_data['chunk']
-        k = int(action_data['k'])
+        try:
+            chunk = action_data['chunk']
+            k = int(action_data['k'])
 
-        # 探针：记录执行前的底层物理步数 (针对 Robosuite)
-        base_env = self.env.env
-        step_before = base_env.cur_time if hasattr(base_env, 'cur_time') else 0
-        
-        if k <= 0:
-            # 修改点：确保 resampled 时也返回 info 字典，且 success_flag 状态保持
-            info = {"exec_len": 0, "resampled": True, "is_success": self.success_flag}
-            return self.current_obs, 0.0, False, False, info
-
-        total_reward = 0.0
-        done = False
-        actual_steps = 0
-        
-        for i in range(k):
-            obs, reward, terminated, tr, info = self.env.step(chunk[i])
-            self.current_step += 1 # 物理步数累加
-            actual_steps += 1
+            # 探针：记录执行前的底层物理步数 (针对 Robosuite)
+            base_env = self.env.env
+            step_before = base_env.cur_time if hasattr(base_env, 'cur_time') else 0
             
-            total_reward += (reward - self.reward_offset)
-            self.current_obs = obs
+            if k <= 0:
+                # 修改点：确保 resampled 时也返回 info 字典，且 success_flag 状态保持
+                info = {"exec_len": 0, "resampled": True, "is_success": self.success_flag}
+                # [探针-重采样]
+                # if self.episode_count == 0 and self.current_step < 500: # 只打印第一个 Episode 的前 50 步
+                    # print(f"\n[PROBE-ENV] Step {self.current_step}: Resample triggered (k=0). Reward Penalty: 0.0 (Applied later in VecEnv)")
+                # k=0 means 0 time passed, so discount is 1.0. Reward is just penalty.
+                return self.current_obs, 0.0, False, False, info
 
-            # --- 录制逻辑 ---
-            if self.save_videos:
-                # 调用包装好的 RobomimicToGymWrapper.render
-                frame = self.env.render(mode="rgb_array", height=160, width=160)
-                self.episode_frames.append(frame)
+            total_discounted_reward = 0.0
+            current_step_gamma = 1.0 # gamma^0
 
-            # 判定成功（Robomimic 典型判定）
-            if reward >= 1.0 or (isinstance(info.get('is_success'), dict) and info['is_success'].get('task')):
-                self.success_flag = True
+            # 定义两个标志位
+            is_terminated = False
+            is_truncated = False
+            actual_steps = 0
 
             
+
+            # [探针-Chunk开始]
+            probe_log = []
             
-            
-            # --- 核心逻辑：双重终止判定 ---
-            # 1. 环境原生结束 (terminated/tr)
-            # 2. 达到你设定的 600 步上限
-            if terminated or tr or self.current_step >= self.max_steps or self.success_flag:
-                done = True
-                break
+            for i in range(k):
+                obs, reward, term, trunc, info = self.env.step(chunk[i])
+                self.current_step += 1 # 物理步数累加
+                actual_steps += 1
+
+                # --- [SMDP] Calculate Discounted Reward Sum ---
+                # R_chunk = r_0 + gamma * r_1 + gamma^2 * r_2 ...
+                r_t = (reward - self.reward_offset)
+                discounted_r_t = r_t * current_step_gamma
+                total_discounted_reward += discounted_r_t
+
+                # # [探针-物理步细节] 记录每一步的原始奖励、当前衰减因子、衰减后奖励
+                # if self.episode_count == 0 and self.current_step < 50:
+                #     probe_log.append(f"  t={i}: r_raw={r_t:.4f} * gam={current_step_gamma:.4f} -> {discounted_r_t:.4f}")
+
+                # Update gamma for next step
+                current_step_gamma *= self.gamma
+                # -----------------------------------------------
 
 
-        # 探针：记录执行后的物理步数
-        step_after = base_env.cur_time if hasattr(base_env, 'cur_time') else 0
-        actual_physics_steps = actual_steps # 循环里的计数
-        
-        # 验证：物理步数增长必须等于实际循环次数
-        # 如果物理步数增长大于 k，说明有隐形步进
-        # print(f"[探针-物理时钟] 环境ID: {os.getpid()} | 请求k: {k} | 实际步进: {actual_physics_steps} | 物理时间增量: {step_after - step_before}")
-        # if self.success_flag:
+
+                self.current_obs = obs
+
+                # --- 录制逻辑 ---
+                if self.save_videos:
+                    # 调用包装好的 RobomimicToGymWrapper.render
+                    frame = self.env.render(mode="rgb_array", height=160, width=160)
+                    self.episode_frames.append(frame)
+
+                # 判定成功（Robomimic 典型判定）
+                if reward >= 1.0 or (isinstance(info.get('is_success'), dict) and info['is_success'].get('task')):
+                    self.success_flag = True
+
+                # --- 核心逻辑修正 ---
+                # 1. 底层环境触发
+                if term: is_terminated = True
+                if trunc: is_truncated = True
+
+                # 2. 成功触发 (视为 terminated)
+                if self.success_flag:
+                    is_terminated = True
+
+                # 3. 步数超限触发 (视为 truncated)
+                if self.current_step >= self.max_steps:
+                    # 只有在还没成功、也没死的情况下，才算超时
+                    if not is_terminated:
+                        is_truncated = True
+                        info["TimeLimit.truncated"] = True # 显式注入
+
+                # 只要任意一个为 True，由于是大循环，都要 break
+                if is_terminated or is_truncated:
+                    break
+
+
+
+            # 探针：记录执行后的物理步数
+            step_after = base_env.cur_time if hasattr(base_env, 'cur_time') else 0
+            actual_physics_steps = actual_steps # 循环里的计数
+            
+            # 验证：物理步数增长必须等于实际循环次数
+            # 如果物理步数增长大于 k，说明有隐形步进
             # print(f"[探针-物理时钟] 环境ID: {os.getpid()} | 请求k: {k} | 实际步进: {actual_physics_steps} | 物理时间增量: {step_after - step_before}")
-        
-
-        # --- 核心修正：显式写回成功信号到 info ---
-        # 这样主进程的 SuccessBestModelCallback 才能看到它
-        info["is_success"] = self.success_flag
-
-        info["exec_len"] = actual_steps
-        info["resampled"] = False
-
-        if done:
-            # 探针：记录 done 瞬间的末尾坐标
-            pos_at_done = self.current_obs.get('robot0_eef_pos', np.zeros(3)).copy()
+            # if self.success_flag:
+                # print(f"[探针-物理时钟] 环境ID: {os.getpid()} | 请求k: {k} | 实际步进: {actual_physics_steps} | 物理时间增量: {step_after - step_before}")
             
-            # 子进程会自动触发底层重置 (如果是 VecEnv 包装的话)
-            # 或者如果是手动重置，在此观察
-            # print(f"[探针-重置] 环境 {os.getpid()} 触发 Done. 终止坐标: {pos_at_done}")
 
-            if self.save_videos and len(self.episode_frames) > 0:
-                self._save_video()
-            self.episode_count += 1
-        
-        return self.current_obs, total_reward, done, False, info
+            # [探针-Chunk结算] 打印汇总
+            # if len(probe_log) > 0:
+            #     print(f"\n[PROBE-ENV] Step {self.current_step - actual_steps} -> {self.current_step} (k={actual_steps}):")
+            #     print("\n".join(probe_log))
+            #     print(f"  => Chunk Reward SMDP Sum: {total_discounted_reward:.4f}")
+
+            # --- 核心修正：显式写回成功信号到 info ---
+            # 这样主进程的 SuccessBestModelCallback 才能看到它
+            info["is_success"] = self.success_flag
+
+            info["exec_len"] = actual_steps
+            info["resampled"] = False
+
+            if is_terminated or is_truncated:
+                # 探针：记录 done 瞬间的末尾坐标
+                pos_at_done = self.current_obs.get('robot0_eef_pos', np.zeros(3)).copy()
+                
+                # 子进程会自动触发底层重置 (如果是 VecEnv 包装的话)
+                # 或者如果是手动重置，在此观察
+                # print(f"[探针-重置] 环境 {os.getpid()} 触发 Done. 终止坐标: {pos_at_done}")
+
+                if self.save_videos and len(self.episode_frames) > 0:
+                    self._save_video()
+                self.episode_count += 1
+            
+            return self.current_obs, total_discounted_reward, is_terminated, is_truncated, info
+        except Exception as e:
+            # 【关键】：在子进程死掉前，强制把错误打印出来
+            import traceback
+            print(f"\n[FATAL ERROR] Worker {self.env_id} crashed!")
+            traceback.print_exc()
+            # 即使崩溃也尝试释放内存，防止拖死整个系统
+            self.episode_frames = [] 
+            raise e # 重新抛出让主进程感知
+
 
     def _save_video(self):
         import imageio
@@ -157,20 +215,24 @@ class InternalVariableChunkWrapper(gym.Wrapper):
             imageio.mimsave(path, self.episode_frames, fps=20)
         except Exception as e:
             print(f"[ERROR] 子进程 {self.env_id} 保存视频失败: {e}")
-        self.episode_frames = [] # 释放内存
+        finally:
+            # 【必须】：无论成功失败，必须清空，否则内存会爆炸导致 Broken Pipe
+            self.episode_frames = []
 
 
 # =============================================================================
 # 修改后的主进程包装器
 # =============================================================================
 class BatchedAdaptiveWrapper(VecEnv):
-    def __init__(self, venv, policy, max_chunk_len, device, reward_offset=0.0, resample_penalty=-0.1, save_all_videos=False, video_dir=None):
+    def __init__(self, venv, policy, max_chunk_len, device, reward_offset=0.0, resample_penalty=-0.1, save_all_videos=False, video_dir=None, 
+                 action_history_len=0):
         self.venv = venv
         self.num_envs = venv.num_envs
         self.policy = policy
         self.max_chunk_len = max_chunk_len
         self.device = device
         self.resample_penalty = resample_penalty
+        self.action_history_len = action_history_len # <--- 存储窗口长度
         
         self.algo_instance = policy.policy if hasattr(policy, 'policy') else policy
         self.action_dim = self.algo_instance.ac_dim
@@ -184,13 +246,41 @@ class BatchedAdaptiveWrapper(VecEnv):
         tmp_obs_batch = venv.reset()
         sample_obs_dict = tmp_obs_batch[0] if isinstance(tmp_obs_batch, list) else {k:v[0] for k,v in tmp_obs_batch.items()}
         obs_vec = self._get_obs_vec(sample_obs_dict)
-        self.total_obs_dim = obs_vec.shape[0] + (max_chunk_len * self.action_dim)
+
+        # --- 【修改】：重新计算 RL 观测空间维度 ---
+        # 维度 = 物理观测 + 动作历史 (len * dim) + 当前预测 Chunk (max_len * dim)
+        self.total_obs_dim = obs_vec.shape[0] + (self.action_history_len * self.action_dim) + (max_chunk_len * self.action_dim)
+        # self.total_obs_dim = obs_vec.shape[0] + (max_chunk_len * self.action_dim)
         
         rl_observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.total_obs_dim,), dtype=np.float32)
         super().__init__(self.num_envs, rl_observation_space, rl_action_space)
 
         self.current_obs_dicts = [None] * self.num_envs
         self.actions_cache = None
+        self.last_chunks = [None] * self.num_envs # 记录上一轮生成的计划，用于更新历史
+
+        # --- 【新增】：初始化动作历史缓冲区 ---
+        # 使用 numpy 数组存储每个环境的动作历史 [num_envs, history_len, action_dim]
+        self.action_histories = np.zeros((self.num_envs, self.action_history_len, self.action_dim), dtype=np.float32)
+
+    def _update_action_history(self, env_idx, executed_actions):
+        """
+        将实际执行的动作推入历史窗口（类似于 Queue 的滑动窗口）
+        """
+        if self.action_history_len <= 0:
+            return
+            
+        num_new = len(executed_actions)
+        if num_new == 0:
+            return
+            
+        if num_new >= self.action_history_len:
+            # 如果新动作比窗口还长，直接取最后段
+            self.action_histories[env_idx] = executed_actions[-self.action_history_len:]
+        else:
+            # 经典的滑动窗口更新：旧数据左移，新数据补右侧
+            self.action_histories[env_idx] = np.roll(self.action_histories[env_idx], -num_new, axis=0)
+            self.action_histories[env_idx][-num_new:] = executed_actions
 
     def _get_obs_vec(self, obs_dict):
         # 静态归一化逻辑
@@ -213,21 +303,36 @@ class BatchedAdaptiveWrapper(VecEnv):
             
         return final_vec
 
-    def _make_rl_obs(self, obs_dict, chunk):
+    def _make_rl_obs(self, env_idx, obs_dict, chunk):
         obs_vec = self._get_obs_vec(obs_dict)
         action_mean = self.stats["action_mean"]
         action_std = self.stats["action_std"]
-        # 对整个 chunk 进行归一化
+
+        # 1. 处理动作历史 (归一化)
+        history_part = np.array([])
+        if self.action_history_len > 0:
+            norm_history = (self.action_histories[env_idx] - action_mean) / action_std
+            history_part = norm_history.flatten()
+
+        # 2. 处理当前预测 Chunk (归一化)
         normalized_chunk = (chunk - action_mean) / action_std
         if normalized_chunk.shape[0] < self.max_chunk_len:
             pad = np.zeros((self.max_chunk_len - normalized_chunk.shape[0], self.action_dim))
             normalized_chunk = np.concatenate([normalized_chunk, pad], axis=0)
-        return np.concatenate([obs_vec, normalized_chunk.flatten()]).astype(np.float32)
+        chunk_part = normalized_chunk.flatten()
+
+        # 3. 拼接：[Obs, History, Chunk]
+        final_vec = np.concatenate([obs_vec, history_part, chunk_part]).astype(np.float32)
+        
+
+        if np.any(np.abs(final_vec) > 50): 
+            print(f"[WARN] Obs normalization outlier: max value {np.max(np.abs(final_vec))}")
+        return final_vec
 
     def step_async(self, actions):
         requested_ks = actions.astype(int)
         # 主进程在 GPU 上批量计算 Chunk
-        batch_chunks = self._get_batch_policy_plan(self.current_obs_dicts)
+        # batch_chunks = self._get_batch_policy_plan(self.current_obs_dicts)
         
         # 探针：观察 Batch 中的 k 分布
         # print(f"[探针-决策] 本轮 Batch 长度分配: {requested_ks.tolist()} | Max k: {np.max(requested_ks)}")
@@ -236,11 +341,12 @@ class BatchedAdaptiveWrapper(VecEnv):
         payloads = []
         for i in range(self.num_envs):
             payloads.append({
-                'chunk': batch_chunks[i],
+                'chunk': self.last_chunks[i],
                 'k': requested_ks[i]
             })
         
         self.actions_cache = requested_ks
+        # self.last_chunks = batch_chunks # 存下来，等 step_wait 时更新历史
         # 发送给子进程：每个进程现在会自己跑 k 步
         self.venv.step_async(payloads)
 
@@ -259,16 +365,31 @@ class BatchedAdaptiveWrapper(VecEnv):
         self.current_obs_dicts = obs_batch
         
         combined_rewards = rews_all.copy()
+
         for i in range(self.num_envs):
+            # 获取实际执行了多少步
+            k_executed = infos_all[i].get("exec_len", 0)
+            
+            # --- 【核心】：在观测返回前更新动作历史 ---
+            if k_executed > 0:
+                # 取得该环境上一轮执行的那些动作
+                actions_taken = self.last_chunks[i][:k_executed]
+                self._update_action_history(i, actions_taken)
+            
+            # 如果环境 Reset 了，历史清零
+            if dones_all[i]:
+                self.action_histories[i] = 0.0
+
             # 处理重采样惩罚 (actions_cache 在 step_async 中保存)
             if self.actions_cache[i] == 0:
                 combined_rewards[i] = self.resample_penalty
             
         # 3. 推理下一阶段计划并构建下一帧 RL 观测
         new_plans = self._get_batch_policy_plan(self.current_obs_dicts)
+        self.last_chunks = new_plans # 更新缓存
         
         next_rl_obs = np.stack([
-            self._make_rl_obs({k: v[i] for k, v in self.current_obs_dicts.items()}, new_plans[i]) 
+            self._make_rl_obs(i, {k: v[i] for k, v in self.current_obs_dicts.items()}, new_plans[i]) 
             for i in range(self.num_envs)
         ])
         
@@ -278,15 +399,49 @@ class BatchedAdaptiveWrapper(VecEnv):
         # 1. 获取 Batch 字典 {'key': [N, ...]}
         obs_batch = self.venv.reset()
         self.current_obs_dicts = obs_batch
+
+        # Reset 时历史全部清零
+        self.action_histories.fill(0.0)
         
         # 2. 一次性推理出所有环境的计划
         batch_chunks = self._get_batch_policy_plan(self.current_obs_dicts)
+        self.last_chunks = batch_chunks
+
+        # 4. 构造完整的 RL 观测 [Obs, History, Chunk]
+        # 我们先单独算一下第一个环境的，用来做探针演示
+        sample_rl_obs_list = []
+        for i in range(self.num_envs):
+            single_obs_dict = {k: v[i] for k, v in self.current_obs_dicts.items()}
+            rl_obs = self._make_rl_obs(i, single_obs_dict, batch_chunks[i])
+            sample_rl_obs_list.append(rl_obs)
         
-        # 3. 将 Batch 字典拆分并为每个环境构建 RL 观测
-        return np.stack([
-            self._make_rl_obs({k: v[i] for k, v in self.current_obs_dicts.items()}, batch_chunks[i]) 
-            for i in range(self.num_envs)
-        ])
+        final_obs_stack = np.stack(sample_rl_obs_list)
+
+        # =========================================================================
+        # 【历史验证探针】
+        # =========================================================================
+        # 动态获取物理维度：通过计算单个环境的物理向量
+        sample_phys_vec = self._get_obs_vec({k: v[0] for k, v in obs_batch.items()})
+        phys_dim = sample_phys_vec.shape[0]
+        hist_dim = self.action_history_len * self.action_dim
+        
+        # 提取第一个环境观测向量中的“历史切片”
+        # 顺序是 [Physical(0:phys_dim), History(phys_dim:phys_dim+hist_dim), Chunk(...)]
+        history_slice = final_obs_stack[0, phys_dim : phys_dim + hist_dim]
+        
+        # 计算理论上的“零动作归一化值”
+        # 因为物理上是填0，所以归一化后应该是 (0 - mean) / std
+        expected_norm_zero = -self.stats["action_mean"] / self.stats["action_std"]
+        theoretical_mean = np.mean(expected_norm_zero)
+        actual_mean = np.mean(history_slice)
+
+        return final_obs_stack
+
+        # # 3. 将 Batch 字典拆分并为每个环境构建 RL 观测
+        # return np.stack([
+        #     self._make_rl_obs(i, {k: v[i] for k, v in self.current_obs_dicts.items()}, batch_chunks[i]) 
+        #     for i in range(self.num_envs)
+        # ])
 
     def _get_batch_policy_plan(self, obs_batch):
         # GPU 批量推理逻辑 (同前，略)
@@ -304,6 +459,28 @@ class BatchedAdaptiveWrapper(VecEnv):
             raw_actions = self.algo_instance._get_action_trajectory(batch_tensor)
             
         return raw_actions.detach().cpu().numpy()
+
+    # =========================================================================
+    # 【新增方法】用于处理 Timeout 时的 Terminal Observation
+    # =========================================================================
+    def get_terminal_rl_obs(self, terminal_obs_dict, env_idx):
+        """
+        严谨版：处理超时瞬间的观测转换，包含该环境正确的动作历史。
+        """
+        # 1. 构造 Batch 并推理 (Batch Size = 1)
+        obs_batch_for_dp = {}
+        valid_keys = list(self.algo_instance.obs_shapes.keys())
+        for k in valid_keys:
+            if k in terminal_obs_dict:
+                val = np.array(terminal_obs_dict[k])
+                if val.ndim == 1: val = val[None, :]
+                obs_batch_for_dp[k] = val
+        
+        # 2. 推理新的 Chunk
+        chunk = self._get_batch_policy_plan(obs_batch_for_dp)[0]
+        
+        # 3. 拼接 RL 向量 (传入 env_idx 以获取该环境的 history)
+        return self._make_rl_obs(env_idx, terminal_obs_dict, chunk)
 
     # 其他接口透传...
     def env_is_wrapped(self, wrapper_class, indices=None):
@@ -336,6 +513,7 @@ class LayerNormMlpExtractor(MlpExtractor):
         super().__init__(feature_dim, net_arch, activation_fn, device)
         # 重新构建 latent_policy_net (Actor) 和 latent_value_net (Critic)
         # 以包含 LayerNorm
+        
         self.latent_policy = self._build_layer_norm_mlp(feature_dim, net_arch["pi"], activation_fn)
         self.latent_value = self._build_layer_norm_mlp(feature_dim, net_arch["vf"], activation_fn)
 
