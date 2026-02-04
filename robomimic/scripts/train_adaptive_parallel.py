@@ -67,7 +67,8 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 # =============================================================================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 # 脚本位于 robomimic/robomimic/scripts/，向上三级到达仓库根目录以找到 wuhao
-repo_root = os.path.abspath(os.path.join(current_dir, "../../..")) 
+# repo_root = os.path.abspath(os.path.join(current_dir, "../../..")) 
+repo_root = os.path.abspath(os.path.join(current_dir, "../.."))
 sys.path.append(repo_root)
 
 # =============================================================================
@@ -814,8 +815,8 @@ def train(args):
     # 4. 【核心修复】：在最外层包装 VecMonitor
     # 这样 VecMonitor 就能看到你 Wrapper 返回的每一个 done=True 和 reward
     venv = VecMonitor(venv)
-    # venv = VecNormalize(venv, norm_obs=False, norm_reward=True, clip_obs=10.)
-    venv = VecNormalize(venv, norm_obs=False, norm_reward=True)
+    venv = VecNormalize(venv, norm_obs=False, norm_reward=True, clip_obs=10.)
+    # venv = VecNormalize(venv, norm_obs=False, norm_reward=True)\
 
 
     # --- D. 模型加载/初始化 ---

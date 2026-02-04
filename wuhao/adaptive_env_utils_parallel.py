@@ -240,7 +240,7 @@ class BatchedAdaptiveWrapper(VecEnv):
         rl_action_space = spaces.Discrete(max_chunk_len + 1)
         
         # 统计数据加载（用于归一化）
-        self.stats = np.load("/home/wuhao/jobspace/robomimic/datasets/tool_hang/ph/toolhang_stats.npz")
+        self.stats = np.load("/home/wuhao/jobspace/luoxu/robomimic/datasets/toolhang/toolhang.npz")
         
         # 探测观测空间维度
         tmp_obs_batch = venv.reset()
@@ -295,6 +295,9 @@ class BatchedAdaptiveWrapper(VecEnv):
                 vecs.append(np.zeros(shape, dtype=np.float32))
         
         final_vec = np.concatenate(vecs)
+
+        # 建议在这里也加上，防止异常值传递给后续逻辑
+        final_vec = np.clip(final_vec, -10.0, 10.0)
         
         # 探针：检查归一化后的量级
         if np.max(np.abs(final_vec)) > 20.0:
