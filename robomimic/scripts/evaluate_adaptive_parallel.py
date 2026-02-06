@@ -2,6 +2,17 @@
 评估脚本: evaluate_adaptive_parallel.py
 功能：加载训练好的 Adaptive RL (PPO) 模型和冻结的 Diffusion Policy，进行并行评估。
 """
+import os
+# 强制使用 EGL 渲染后端
+os.environ['MUJOCO_GL'] = 'egl'
+# 禁用一些可能导致冲突的渲染特性
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+
+# 针对 NVIDIA 驱动的特殊设置，防止多进程冲突
+os.environ['EGL_PBUFFER_WIDTH'] = '160'
+os.environ['EGL_PBUFFER_HEIGHT'] = '160'
+# 限制 ffmpeg 的线程数，防止它在编码视频时抢走所有 CPU 资源导致其他进程渲染超时
+os.environ['IMAGEIO_FFMPEG_THREADS'] = '2'
 
 import argparse
 import sys
@@ -82,7 +93,11 @@ class SMDPPPO(PPO):
 # 3. 环境构建函数 (Eval 版)
 # =============================================================================
 
-def make_eval_env(env_meta, env_id, args, render_offscreen=False):
+def make_eval_env(env_meta, env_id, args, render_offscreen=False, save_data=False):
+    # [新增] 让不同环境错开初始化时间，避免抢夺显卡驱动
+    import time
+    time.sleep(env_id * 2)
+
     # 设置随机种子
     base_seed = args.seed
     worker_seed = base_seed + env_id
@@ -142,6 +157,7 @@ def make_eval_env(env_meta, env_id, args, render_offscreen=False):
         reward_offset=1.0, 
         max_steps=args.horizon, # 使用传入的 horizon
         save_videos=render_offscreen, # 如果 render_offscreen 为 True，则开启录制
+        save_data=save_data,          # 控制数据 [新增]
         video_dir=args.video_dir,
         env_id=env_id,
         gamma=0.999 # 评估时 gamma 不影响策略执行，但 Wrapper 需要参数
@@ -154,6 +170,11 @@ def make_eval_env(env_meta, env_id, args, render_offscreen=False):
 # =============================================================================
 
 def evaluate(args):
+    # [新增] 强制单进程逻辑
+    if args.save_data and args.n_envs > 1:
+        print(f"\n[WARNING] 检测到开启了 --save_data (保存带图片的PKL)。")
+        print(f"[WARNING] 为了防止并发渲染导致的显存缓冲区冲突（雪花图、翻转图），强制将 n_envs 设为 1。")
+        args.n_envs = 1
 
     # [新增] 强制 PyTorch 使用确定性算法
     torch.manual_seed(args.seed)
@@ -202,9 +223,15 @@ def evaluate(args):
     
     print(f"[INFO] Evaluation Horizon: {env_meta['env_kwargs']['horizon']}")
 
+    # [修改点] 确定是否需要开启离屏渲染
+    # 只要需要保存视频 OR 需要在 pkl 中存图，就必须设为 True
+    need_render = args.save_video or args.save_data # [新增逻辑]
+
     # 3. 创建并行环境
     # 如果 save_video 为 True，我们需要 render_offscreen=True
-    env_fns = [partial(make_eval_env, env_meta, i, args, render_offscreen=args.save_video) 
+    env_fns = [partial(make_eval_env, env_meta, i, args, 
+                       render_offscreen=need_render, # 是否存 MP4
+                       save_data=args.save_data)         # 是否存 PKL [新增]
                for i in range(args.n_envs)]
     
     print(f"[INFO] Launching {args.n_envs} parallel environments...")
@@ -268,8 +295,20 @@ def evaluate(args):
             action = np.full(venv.num_envs, args.fixed_chunk_len, dtype=int)
         else:
             # 如果是 RL 模式，使用模型预测
-            # action, _ = model.predict(obs, deterministic=True)
-            action, _ = model.predict(obs, deterministic=False)
+            action, _ = model.predict(obs, deterministic=True)
+            # action, _ = model.predict(obs, deterministic=False)
+
+            # [新增] 提取分布并传给 Wrapper
+            # 仅当需要保存数据时才做这个计算（省资源）
+            if args.save_data:
+                obs_tensor = torch.as_tensor(obs).to(device)
+                with torch.no_grad():
+                    # SB3 PPO 策略提取分布概率
+                    dist = model.policy.get_distribution(obs_tensor)
+                    probs = dist.distribution.probs.cpu().numpy()
+                venv.set_next_step_dists(probs)
+            else:
+                venv.set_next_step_dists(None)
         
         # 统计动作分布
         for a in action:
@@ -368,6 +407,8 @@ if __name__ == "__main__":
     # 视频保存
     parser.add_argument("--save_video", action="store_true", help="Enable video recording")
     parser.add_argument("--video_dir", type=str, default="eval_videos", help="Directory to save videos and results")
+
+    parser.add_argument("--save_data", action="store_true", help="Enable data logging (PKL: state, action, dist)") # [新增]
 
     args = parser.parse_args()
     

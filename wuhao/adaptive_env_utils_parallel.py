@@ -21,6 +21,24 @@ import os
 import torch.nn as nn
 import collections # 顶部增加导入
 
+import pickle # 新增
+import copy   # 新增
+
+import threading # 顶部增加
+
+def _async_save_worker(vid_path, frames, data_path, log_data, save_videos, save_data):
+    """ 在后台线程中执行沉重的写磁盘操作 """
+    try:
+        import imageio
+        import pickle
+        if save_videos and frames:
+            imageio.mimsave(vid_path, frames, fps=20)
+        if save_data and log_data:
+            with open(data_path, 'wb') as f:
+                pickle.dump(log_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        print(f"[ERROR] Async save failed: {e}")
+
 
 class RobomimicToGymWrapper(gym.Env):
     def __init__(self, env):
@@ -47,11 +65,12 @@ class RobomimicToGymWrapper(gym.Env):
 # Modified: Internal wrapper supporting Gamma Discounting
 # =============================================================================
 class InternalVariableChunkWrapper(gym.Wrapper):
-    def __init__(self, env, reward_offset=0.0, max_steps=600, save_videos=False, video_dir=None, env_id=0, gamma=0.99):
+    def __init__(self, env, reward_offset=0.0, max_steps=600, save_videos=False, save_data=False, video_dir=None, env_id=0, gamma=0.99):
         super().__init__(env)
         self.reward_offset = reward_offset
         self.max_steps = max_steps
         self.save_videos = save_videos
+        self.save_data = save_data # <--- [修改] 保存开关
         self.video_dir = video_dir
         self.env_id = env_id  # 用于区分不同进程的文件名
         self.gamma = gamma  # <--- [SMDP] Receive Gamma
@@ -62,7 +81,15 @@ class InternalVariableChunkWrapper(gym.Wrapper):
         self.current_obs = None
         self.success_flag = False
 
-        if self.save_videos and self.video_dir:
+        # [修改] 仅当需要保存数据时才初始化日志
+        self.episode_log = None
+        if self.save_data:
+            self.episode_log = {
+                'trajectory': [], 
+                'decisions': [] 
+            }
+
+        if (self.save_videos or self.save_data) and self.video_dir:
             os.makedirs(self.video_dir, exist_ok=True)
 
     def reset(self, **kwargs):
@@ -71,12 +98,29 @@ class InternalVariableChunkWrapper(gym.Wrapper):
         self.episode_frames = []
         self.success_flag = False
         self.current_obs = obs
+
+        # [修改] 重置日志
+        if self.save_data:
+            self.episode_log = {
+                'trajectory': [], 
+                'decisions': []
+            }
+
         return obs, info
 
     def step(self, action_data):
         try:
             chunk = action_data['chunk']
             k = int(action_data['k'])
+            dist_probs = action_data.get('dist_probs', None)
+
+            # [修改] 仅在开启 save_data 时记录决策
+            if self.save_data:
+                self.episode_log['decisions'].append({
+                    'step_start': self.current_step,
+                    'chosen_k': k,
+                    'policy_dist': dist_probs 
+                })
 
             # 探针：记录执行前的底层物理步数 (针对 Robosuite)
             base_env = self.env.env
@@ -105,6 +149,26 @@ class InternalVariableChunkWrapper(gym.Wrapper):
             probe_log = []
             
             for i in range(k):
+
+                # 1. 统一获取当前帧 (如果需要保存任何数据)
+                curr_frame = None
+
+                if self.save_data or self.save_videos:
+                    # 显式使用 .copy() 确保数据独立，避免缓冲区被底层环境修改
+                    raw_frame = self.env.render(mode="rgb_array", height=160, width=160)
+                    curr_frame = np.array(raw_frame).copy()
+
+                # 2. 记录到数据日志
+                if self.save_data:
+                    step_record = {
+                        'step': self.current_step,
+                        'obs': copy.deepcopy(self.current_obs),
+                        'action': chunk[i].copy(),
+                        'image': curr_frame # 直接复用已渲染的帧
+                    }
+                    self.episode_log['trajectory'].append(step_record)
+
+
                 obs, reward, term, trunc, info = self.env.step(chunk[i])
                 self.current_step += 1 # 物理步数累加
                 actual_steps += 1
@@ -128,10 +192,8 @@ class InternalVariableChunkWrapper(gym.Wrapper):
                 self.current_obs = obs
 
                 # --- 录制逻辑 ---
-                if self.save_videos:
-                    # 调用包装好的 RobomimicToGymWrapper.render
-                    frame = self.env.render(mode="rgb_array", height=160, width=160)
-                    self.episode_frames.append(frame)
+                if self.save_videos and curr_frame is not None:
+                    self.episode_frames.append(curr_frame)
 
                 # 判定成功（Robomimic 典型判定）
                 if reward >= 1.0 or (isinstance(info.get('is_success'), dict) and info['is_success'].get('task')):
@@ -184,16 +246,15 @@ class InternalVariableChunkWrapper(gym.Wrapper):
             info["resampled"] = False
 
             if is_terminated or is_truncated:
+                # [修改] 根据开关分别保存
+                self._handle_episode_done()
+                self.episode_count += 1
                 # 探针：记录 done 瞬间的末尾坐标
                 pos_at_done = self.current_obs.get('robot0_eef_pos', np.zeros(3)).copy()
                 
                 # 子进程会自动触发底层重置 (如果是 VecEnv 包装的话)
                 # 或者如果是手动重置，在此观察
                 # print(f"[探针-重置] 环境 {os.getpid()} 触发 Done. 终止坐标: {pos_at_done}")
-
-                if self.save_videos and len(self.episode_frames) > 0:
-                    self._save_video()
-                self.episode_count += 1
             
             return self.current_obs, total_discounted_reward, is_terminated, is_truncated, info
         except Exception as e:
@@ -205,19 +266,45 @@ class InternalVariableChunkWrapper(gym.Wrapper):
             self.episode_frames = [] 
             raise e # 重新抛出让主进程感知
 
-
-    def _save_video(self):
-        import imageio
-        status = "success" if self.success_flag else "fail"
-        filename = f"env_{self.env_id}_ep_{self.episode_count:03d}_{status}.mp4"
-        path = os.path.join(self.video_dir, filename)
+    def _handle_episode_done(self):
         try:
-            imageio.mimsave(path, self.episode_frames, fps=20)
-        except Exception as e:
-            print(f"[ERROR] 子进程 {self.env_id} 保存视频失败: {e}")
-        finally:
-            # 【必须】：无论成功失败，必须清空，否则内存会爆炸导致 Broken Pipe
+            status = "success" if self.success_flag else "fail"
+            
+            # 准备文件名
+            vid_path = os.path.join(self.video_dir, f"env_{self.env_id}_ep_{self.episode_count:03d}_{status}.mp4")
+            data_path = os.path.join(self.video_dir, f"env_{self.env_id}_ep_{self.episode_count:03d}_{status}_data.pkl")
+            
+            # 立即复制数据并清空原列表，确保主进程可以继续
+            frames_to_save = self.episode_frames
             self.episode_frames = []
+            log_to_save = self.episode_log
+            if self.save_data:
+                self.episode_log = {'trajectory': [], 'decisions': []}
+
+            # 启动后台线程保存，不阻塞当前 worker 的重置和下一轮渲染
+            t = threading.Thread(
+                target=_async_save_worker, 
+                args=(vid_path, frames_to_save, data_path, log_to_save, self.save_videos, self.save_data)
+            )
+            t.start()
+
+        except Exception as e:
+            print(f"[ERROR] Worker {self.env_id} failed to trigger async save: {e}")
+            
+
+
+    # def _save_video(self):
+    #     import imageio
+    #     status = "success" if self.success_flag else "fail"
+    #     filename = f"env_{self.env_id}_ep_{self.episode_count:03d}_{status}.mp4"
+    #     path = os.path.join(self.video_dir, filename)
+    #     try:
+    #         imageio.mimsave(path, self.episode_frames, fps=20)
+    #     except Exception as e:
+    #         print(f"[ERROR] 子进程 {self.env_id} 保存视频失败: {e}")
+    #     finally:
+    #         # 【必须】：无论成功失败，必须清空，否则内存会爆炸导致 Broken Pipe
+    #         self.episode_frames = []
 
 
 # =============================================================================
@@ -262,6 +349,14 @@ class BatchedAdaptiveWrapper(VecEnv):
         # --- 【新增】：初始化动作历史缓冲区 ---
         # 使用 numpy 数组存储每个环境的动作历史 [num_envs, history_len, action_dim]
         self.action_histories = np.zeros((self.num_envs, self.action_history_len, self.action_dim), dtype=np.float32)
+
+        # [新增] 暂存 Policy 分布
+        self.next_step_dists = None
+
+    # [新增] 外部调用接口
+    def set_next_step_dists(self, dists):
+        """dists: numpy array (num_envs, num_actions)"""
+        self.next_step_dists = dists
 
     def _update_action_history(self, env_idx, executed_actions):
         """
@@ -343,10 +438,18 @@ class BatchedAdaptiveWrapper(VecEnv):
         # 构建指令包
         payloads = []
         for i in range(self.num_envs):
-            payloads.append({
+            data = {
                 'chunk': self.last_chunks[i],
                 'k': requested_ks[i]
-            })
+            }
+            # [修改] 如果有分布数据则发送，训练时通常为 None
+            if self.next_step_dists is not None:
+                data['dist_probs'] = self.next_step_dists[i]
+            
+            payloads.append(data)
+
+        # 清空
+        self.next_step_dists = None
         
         self.actions_cache = requested_ks
         # self.last_chunks = batch_chunks # 存下来，等 step_wait 时更新历史
