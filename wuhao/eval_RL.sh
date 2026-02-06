@@ -7,12 +7,13 @@ AGENT="/home/wuhao/jobspace/luoxu/robomimic/models/tool_hang_epoch_12.pth"
 RL_MODEL="/home/wuhao/jobspace/luoxu/robomimic/wuhao/adaptive_rl_results/tb_logs/new_server_optimized/PPO_0131_170419/checkpoints/adaptive_agent_4999200_steps.zip"
 
 # 基础输出目录
-# BASE_OUTPUT_DIR="/home/wuhao/jobspace/luoxu/robomimic/wuhao/adaptive_rl_results/eval_results/eval_adaptive_parallel_new_server_optimized_4999200_random"
-BASE_OUTPUT_DIR="/home/wuhao/jobspace/luoxu/robomimic/wuhao/adaptive_rl_results/eval_results/fixed11"
+# BASE_OUTPUT_DIR="/home/wuhao/jobspace/luoxu/robomimic/wuhao/adaptive_rl_results/eval_results/eval_adaptive_parallel_new_server_optimized_4999200_deterministic"
+# BASE_OUTPUT_DIR="/home/wuhao/jobspace/luoxu/robomimic/wuhao/adaptive_rl_results/eval_results/fixed9_again"
+BASE_OUTPUT_DIR="/home/wuhao/jobspace/luoxu/robomimic/wuhao/adaptive_rl_results/eval_results/save_data_test"
 
 # 定义 3 个不同的种子
-SEEDS=(2024 2025 2026)
-# SEEDS=(2024)
+# SEEDS=(2024 2025 2026)
+SEEDS=(2025)
 
 # 循环测试
 for SEED in "${SEEDS[@]}"; do
@@ -25,14 +26,17 @@ for SEED in "${SEEDS[@]}"; do
     (
         CUDA_VISIBLE_DEVICES=3 python /home/wuhao/jobspace/luoxu/robomimic/robomimic/scripts/evaluate_adaptive_parallel.py \
             --agent ${AGENT} \
-            --n_rollouts 200 \
-            --n_envs 16 \
+            --n_rollouts 5 \
+            --rl_model ${RL_MODEL} \
+            --n_envs 2 \
             --horizon 600 \
             --seed ${SEED} \
             --max_chunk_len 32 \
             --action_history_len 0 \
             --video_dir ${CURR_DIR} \
-            --fixed_chunk_len 11  # 如果需要测固定长度，取消注释上面并注释掉 --rl_model
+            --save_data \
+            # --fixed_chunk_len 9  # 如果需要测固定长度，取消注释上面并注释掉 --rl_model
+                        # --rl_model ${RL_MODEL} \
             # --save_video \
             # --rl_model ${RL_MODEL} \
     ) &
